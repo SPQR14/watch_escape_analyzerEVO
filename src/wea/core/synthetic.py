@@ -84,9 +84,7 @@ class SyntheticEscapeGenerator:
 
         half_be_s = 0.5 * (true_beat_error_ms * 1e-3)
 
-        dt_p1_p3 = self.compute_p1_p3_delay(
-            true_amplitude_deg, actual_beat_period=mean_beat_period
-        )
+        dt_p1_p3 = self.compute_p1_p3_delay(true_amplitude_deg, actual_beat_period=mean_beat_period)
         dt_p1_p2 = 0.28 * dt_p1_p3
 
         kernel_len = int(0.0025 * fs)
@@ -105,17 +103,14 @@ class SyntheticEscapeGenerator:
         env_p3 = (t_k / (tau_p3 * 0.25)) * np.exp(-t_k / tau_p3)
         env_p3 /= np.max(env_p3) + 1e-12
 
-        carrier_p1 = (
-            0.6 * np.sin(2.0 * np.pi * 7200.0 * t_k)
-            + 0.4 * np.sin(2.0 * np.pi * 12400.0 * t_k)
+        carrier_p1 = 0.6 * np.sin(2.0 * np.pi * 7200.0 * t_k) + 0.4 * np.sin(
+            2.0 * np.pi * 12400.0 * t_k
         )
-        carrier_p2 = (
-            0.5 * np.sin(2.0 * np.pi * 8500.0 * t_k)
-            + 0.5 * np.sin(2.0 * np.pi * 14200.0 * t_k)
+        carrier_p2 = 0.5 * np.sin(2.0 * np.pi * 8500.0 * t_k) + 0.5 * np.sin(
+            2.0 * np.pi * 14200.0 * t_k
         )
-        carrier_p3 = (
-            0.55 * np.sin(2.0 * np.pi * 9600.0 * t_k)
-            + 0.45 * np.sin(2.0 * np.pi * 15500.0 * t_k)
+        carrier_p3 = 0.55 * np.sin(2.0 * np.pi * 9600.0 * t_k) + 0.45 * np.sin(
+            2.0 * np.pi * 15500.0 * t_k
         )
 
         amp_p1 = 0.55

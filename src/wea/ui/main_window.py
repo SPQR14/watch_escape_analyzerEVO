@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import csv
-from pathlib import Path
 import time
+from pathlib import Path
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QSize, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPageLayout, QPageSize
+from PyQt6.QtGui import QColor, QFont, QImage, QPageLayout, QPageSize, QPainter
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -24,8 +25,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
-    QSplitter,
     QSpinBox,
+    QSplitter,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
@@ -40,7 +41,6 @@ from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.i18n.translator import Translator
 from wea.utils.audio_io import (
     is_flac_supported,
-    preferred_audio_format,
     save_audio_recording,
 )
 from wea.utils.logger_setup import LoggerSetup
@@ -258,11 +258,11 @@ class HudCard(QFrame):
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
         self.value_label.setFont(mono_font)
         self.value_label.setStyleSheet(
-            f'color: {self._accent_color}; '
+            f"color: {self._accent_color}; "
             f'font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; '
-            f'font-size: 39pt; '
-            f'font-weight: 800; '
-            f'padding-bottom: 2px;'
+            f"font-size: 39pt; "
+            f"font-weight: 800; "
+            f"padding-bottom: 2px;"
         )
 
         layout.addLayout(header_layout)
@@ -1190,7 +1190,9 @@ class MainWin(QMainWindow):
                     name = dev.get("name", f"Device {idx}")
                     self.cmb_device.addItem(f"[{idx}] {name}", idx)
                     hw_count += 1
-            logger.info("Initialized audio input devices: 1 synthetic + %d hardware inputs", hw_count)
+            logger.info(
+                "Initialized audio input devices: 1 synthetic + %d hardware inputs", hw_count
+            )
         except Exception as exc:
             logger.warning("Could not query hardware audio devices: %s", exc)
 
@@ -1267,7 +1269,9 @@ class MainWin(QMainWindow):
 
     def _refresh_global_stats_table(self) -> None:
         """Update the positional summary table and compute multi-position mean & max delta."""
-        positions_order = [p for p in ("DU", "DD", "CU", "CD", "CL", "CR") if p in self._saved_positions]
+        positions_order = [
+            p for p in ("DU", "DD", "CU", "CD", "CL", "CR") if p in self._saved_positions
+        ]
         self.tbl_global_stats.setRowCount(len(positions_order))
 
         rates: list[float] = []
@@ -1508,8 +1512,7 @@ class MainWin(QMainWindow):
         cfg = self.current_watch_config()
         pos = self.cmb_position.currentText()
         header_line = (
-            f"{test_name} | {caliber} | {cfg.bph} BPH | "
-            f"Lift {cfg.lift_angle:.1f}° | Pos {pos}"
+            f"{test_name} | {caliber} | {cfg.bph} BPH | Lift {cfg.lift_angle:.1f}° | Pos {pos}"
         )
         painter.drawText(16, 26, header_line)
 
@@ -1563,16 +1566,24 @@ class MainWin(QMainWindow):
                     writer.writerow(["trace_name", "x", "y"])
                     if x_even is not None and y_even is not None:
                         for x_val, y_val in zip(x_even, y_even):
-                            writer.writerow(["paper_tape_even", f"{float(x_val):.6f}", f"{float(y_val):.4f}"])
+                            writer.writerow(
+                                ["paper_tape_even", f"{float(x_val):.6f}", f"{float(y_val):.4f}"]
+                            )
                     if x_odd is not None and y_odd is not None:
                         for x_val, y_val in zip(x_odd, y_odd):
-                            writer.writerow(["paper_tape_odd", f"{float(x_val):.6f}", f"{float(y_val):.4f}"])
+                            writer.writerow(
+                                ["paper_tape_odd", f"{float(x_val):.6f}", f"{float(y_val):.4f}"]
+                            )
                     if x_osc is not None and y_osc is not None:
                         for x_val, y_val in zip(x_osc, y_osc):
-                            writer.writerow(["oscilloscope", f"{float(x_val):.6f}", f"{float(y_val):.6f}"])
+                            writer.writerow(
+                                ["oscilloscope", f"{float(x_val):.6f}", f"{float(y_val):.6f}"]
+                            )
                     if x_wav is not None and y_wav is not None:
                         for x_val, y_val in zip(x_wav, y_wav):
-                            writer.writerow(["audio_waveform", f"{float(x_val):.6f}", f"{float(y_val):.6f}"])
+                            writer.writerow(
+                                ["audio_waveform", f"{float(x_val):.6f}", f"{float(y_val):.6f}"]
+                            )
             elif ext == ".pdf":
                 printer = QPrinter(QPrinter.PrinterMode.HighResolution)
                 printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
@@ -1680,11 +1691,7 @@ class MainWin(QMainWindow):
         self, file_path: Path | str | None = None, prefer_flac: bool = True
     ) -> Path | None:
         """Record test-duration audio and offer to save it (default FLAC if supported, else Vorbis)."""
-        if (
-            file_path is None
-            and self.worker is not None
-            and self.worker.isRunning()
-        ):
+        if file_path is None and self.worker is not None and self.worker.isRunning():
             self._save_audio_on_finish = True
             logger.info(
                 "Audio recording armed for active test session; will prompt to save upon completion"
@@ -2001,8 +2008,10 @@ class MainWin(QMainWindow):
                 self.osc_impulse_markers.setData(spots)
 
         # Update Bottom-Right Audio Waveform Graph (peak-preserving decimation to avoid aliasing)
-        wave_stream = audio_chunk if (audio_chunk is not None and len(audio_chunk) > 0) else (
-            beats[-1].raw_waveform if beats else None
+        wave_stream = (
+            audio_chunk
+            if (audio_chunk is not None and len(audio_chunk) > 0)
+            else (beats[-1].raw_waveform if beats else None)
         )
         if wave_stream is not None and len(wave_stream) > 0:
             max_amp = float(np.max(np.abs(wave_stream))) or 1.0
