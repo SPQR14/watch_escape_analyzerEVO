@@ -7,7 +7,7 @@ name = "wea"
 version = "0.1.0"
 description = "Watch Escape Analyzer EVO - High-precision horological DSP and acoustic telemetry suite"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
 authors = [
     { name = "Alberto Pico Lara" }
@@ -24,6 +24,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-cov",
+    "pytest-qt",
+    "scipy",
 ]
 
 [project.scripts]
