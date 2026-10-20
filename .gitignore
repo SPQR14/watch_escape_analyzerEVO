@@ -1,120 +1,42 @@
-# ==========================================
-# macOS & Linux OS Artifacts
-# ==========================================
+# macOS & Linux artifacts
 .DS_Store
 .AppleDouble
-.LSOverride
 ._*
-.Spotlight-V100
-.Trashes
 *~
-.directory
-.Trash-*
 
-# ==========================================
-# Python & Packaging
-# ==========================================
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual Environments
-.env
-.venv
-env/
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Pytest & Coverage
+build/
+dist/
+*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
-.nox/
-.hypothesis/
 
-# ==========================================
-# C / C++ & Native Extensions (Pybind11/CMake)
-# ==========================================
-*.d
-*.o
-*.obj
-*.ko
-*.elf
-*.ilk
-*.map
-*.exp
-*.gch
-*.pch
-*.lib
-*.a
-*.la
-*.lo
-*.dll
-*.dylib
-*.exe
-*.out
-*.app
+# C/C++ & native extensions
 CMakeFiles/
 CMakeCache.txt
-cmake_install.cmake
-Makefile
-compile_commands.json
-_deps/
+*.o
+*.so
+*.dylib
+*.dll
+*.a
 
-# ==========================================
-# Qt / PyQt6 Specific
-# ==========================================
-*.pro.user
-*.pro.user.*
-*.qbs.user
-*.qbs.user.*
-*.moc
-moc_*.cpp
-moc_*.h
-qrc_*.cpp
-ui_*.h
+# Qt / PyQt6
 *.qm
+*.moc
+ui_*.h
 
-# ==========================================
-# Data, Audio Captures & ML Models (Local)
-# ==========================================
+# Audio captures & local models
 *.wav
 *.flac
 *.raw
 *.npz
-*.pkl
 *.onnx
 *.pt
-*.pth
 recordings/
 datasets/
-
-# ==========================================
-# IDEs & Editors
-# ==========================================
-.vscode/
-.idea/
-*.swp
-*.swo
