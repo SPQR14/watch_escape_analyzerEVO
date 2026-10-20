@@ -6,6 +6,9 @@ import numpy as np
 from scipy.signal import butter, hilbert, sosfiltfilt
 
 from wea.core.models import BeatEvent, TelemetryResult, WatchConfig
+from wea.utils.logger_setup import LoggerSetup
+
+logger = LoggerSetup.setup_logger(__name__)
 
 
 class EscapeDSPPipeline:
@@ -39,6 +42,13 @@ class EscapeDSPPipeline:
         self.config = config
         self.p1_threshold_ratio = p1_threshold_ratio
         self._sos = self._design_bandpass_sos()
+        logger.info(
+            "EscapeDSPPipeline initialized with sample_rate=%.1f Hz, "
+            "nominal_beat_period=%.6f s, lift_angle=%.2f deg",
+            self.config.sample_rate,
+            self.config.nominal_beat_period,
+            self.config.lift_angle,
+        )
 
     def _design_bandpass_sos(self) -> np.ndarray:
         """Design a Butterworth bandpass filter in Second-Order Sections (SOS) format."""
@@ -48,7 +58,10 @@ class EscapeDSPPipeline:
         return butter(self.FILTER_ORDER, [low, high], btype="bandpass", output="sos")
 
     def filter_signal(self, raw_signal: np.ndarray) -> np.ndarray:
-        """Apply zero-phase forward-backward SOS Butterworth bandpass filter."""
+        """Apply zero-phase forward-backward SOS Butterworth \
+            bandpass filter."""
+        logger.info(
+            "Filtering raw signal with bandpass %.1f Hz - %.1f Hz (order)")
         if len(raw_signal) == 0:
             return raw_signal.copy()
         return sosfiltfilt(self._sos, raw_signal)
@@ -56,7 +69,8 @@ class EscapeDSPPipeline:
     def compute_dual_envelopes(
         self, filtered_signal: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Extract coarse global RMS envelope and fine sub-millisecond envelope.
+        """Extract coarse global RMS envelope and fine sub-millisecond
+        envelope.
 
         Args:
             filtered_signal: Bandpass-filtered 1D acoustic waveform.
@@ -229,7 +243,8 @@ class EscapeDSPPipeline:
             (nominal_period - measured_beat_period) / measured_beat_period
         )
 
-        # Beat Error in milliseconds: absolute difference between even and odd beat intervals
+        # Beat Error in milliseconds: absolute difference between even and
+        #  odd beat intervals
         beat_error_ms = abs(mean_even - mean_odd) * 1000.0
 
         # Balance wheel amplitude from P1 -> P3 transit time:
@@ -247,7 +262,8 @@ class EscapeDSPPipeline:
             sin_val = float(np.sin(sin_arg))
             if sin_val > 1e-6:
                 amplitude_deg = float(
-                    np.clip(self.config.lift_angle / (2.0 * sin_val), 50.0, 360.0)
+                    np.clip(self.config.lift_angle / (2.0 * sin_val), 50.0,
+                            360.0)
                 )
             else:
                 amplitude_deg = 0.0
