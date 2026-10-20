@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import time
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -16,11 +17,13 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QMainWindow,
     QProgressBar,
     QPushButton,
     QSplitter,
     QSpinBox,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,6 +38,8 @@ from wea.i18n.translator import Translator
 
 # Configure PyQtGraph global options for crisp anti-aliased industrial plotting
 pg.setConfigOptions(antialias=True, background="#0d1015", foreground="#9aa5b4")
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 
 CALIBER_PRESETS: dict[str, tuple[int, float]] = {
@@ -59,6 +64,15 @@ POSITION_VARIATION: dict[str, tuple[float, float, float]] = {
 }
 
 
+class ComboPopupItemDelegate(QStyledItemDelegate):
+    """Custom item delegate ensuring generous row height for QComboBox popup items on macOS."""
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        size = super().sizeHint(option, index)
+        size.setHeight(max(size.height(), 28))
+        return size
+
+
 class SyntheticTelemetryWorker(QThread):
     """Background worker thread that synthesizes and analyzes escapement audio in real time.
 
@@ -66,7 +80,7 @@ class SyntheticTelemetryWorker(QThread):
     without blocking the PyQt6 UI thread.
     """
 
-    telemetry_updated = pyqtSignal(object, object, float, float)
+    telemetry_updated = pyqtSignal(object, object, float, float, object)
     session_finished = pyqtSignal()
 
     def __init__(
@@ -104,22 +118,23 @@ class SyntheticTelemetryWorker(QThread):
         start_wall = time.monotonic()
         step_interval = 0.25
         step_idx = 0
+        chunk_samples = int(0.6 * fs)
 
         while self._running:
             elapsed = time.monotonic() - start_wall
             if elapsed > self.duration_s + self.stabilization_s:
                 break
 
-            inst_rate = base_rate + float(rng.normal(0.0, 0.08))
-            inst_be = max(0.0, base_be + float(rng.normal(0.0, 0.015)))
-            inst_amp = base_amp + float(rng.normal(0.0, 0.6))
-            snr_db = 38.0 + float(rng.normal(0.0, 0.8))
+            inst_amp = base_amp + float(rng.normal(0.0, 2.5))
+            snr_db = 32.0 + float(rng.normal(0.0, 1.5))
 
+            # Synthesize a fresh acoustic window per step (with constant ground-truth rate/BE
+            # so the paper tape draws a straight line while the oscilloscope & audio waveform move live)
             gen = SyntheticEscapeGenerator(config=self.config, seed=1000 + step_idx)
             synth_signal = gen.generate(
                 duration_s=window_seconds,
-                true_rate_spd=inst_rate,
-                true_beat_error_ms=inst_be,
+                true_rate_spd=base_rate,
+                true_beat_error_ms=base_be,
                 true_amplitude_deg=inst_amp,
                 snr_db=snr_db,
             )
@@ -128,8 +143,31 @@ class SyntheticTelemetryWorker(QThread):
             window_data = ring_buffer.read_latest(int(window_seconds * fs))
             telemetry, beats = pipeline.analyze(window_data)
 
+            # Apply live acoustic micro-modulation to the displayed beat waveform
+            # so the real-time oscilloscope visibly animates on every frame
+            if beats:
+                last_b = beats[-1]
+                w = last_b.raw_waveform
+                if len(w) > 0:
+                    t_local = np.arange(len(w), dtype=np.float64) / fs
+                    phase_shift = float(rng.uniform(0.0, 2.0 * np.pi))
+                    mod = 1.0 + 0.18 * np.sin(2.0 * np.pi * 1100.0 * t_local + phase_shift)
+                    jitter_noise = rng.normal(0.0, 0.04 * ( float(np.max(np.abs(w))) or 1.0 ), size=len(w))
+                    beats[-1] = BeatEvent(
+                        timestamp_p1=last_b.timestamp_p1,
+                        timestamp_p2=last_b.timestamp_p2,
+                        timestamp_p3=last_b.timestamp_p3,
+                        peak_energy=last_b.peak_energy,
+                        raw_waveform=(w * mod) + jitter_noise,
+                    )
+
+            # Shift window slice per step so the audio waveform scrolls dynamically
+            max_start = max(1, len(window_data) - chunk_samples)
+            start_idx = (step_idx * int(0.035 * fs)) % max_start
+            audio_slice = window_data[start_idx : start_idx + chunk_samples].copy()
+
             if self._running:
-                self.telemetry_updated.emit(telemetry, beats, elapsed, snr_db)
+                self.telemetry_updated.emit(telemetry, beats, elapsed, snr_db, audio_slice)
 
             step_idx += 1
             sleep_deadline = time.monotonic() + step_interval
@@ -167,11 +205,12 @@ class HudCard(QFrame):
         header_layout.addWidget(self.unit_label)
 
         self.value_label = QLabel("---.-")
+        self.value_label.setMinimumHeight(34)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        mono_font = QFont("JetBrains Mono", 24, QFont.Weight.Bold)
+        mono_font = QFont("JetBrains Mono", 22, QFont.Weight.Bold)
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
         self.value_label.setFont(mono_font)
-        self.value_label.setStyleSheet(f"color: {self._accent_color};")
+        self.value_label.setStyleSheet(f"color: {self._accent_color}; padding-bottom: 2px;")
 
         layout.addLayout(header_layout)
         layout.addWidget(self.value_label)
@@ -217,71 +256,186 @@ class MainWin(QMainWindow):
         self._refresh_global_stats_table()
 
     def _apply_industrial_theme(self) -> None:
-        """Apply dark industrial test-bench stylesheet."""
+        """Apply dark industrial test-bench stylesheet with macOS QComboBox & QSpinBox fixes."""
+        up_arrow = (ASSETS_DIR / "arrow_up.svg").as_posix()
+        down_arrow = (ASSETS_DIR / "arrow_down.svg").as_posix()
+        up_arrow_dis = (ASSETS_DIR / "arrow_up_disabled.svg").as_posix()
+        down_arrow_dis = (ASSETS_DIR / "arrow_down_disabled.svg").as_posix()
+
         self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
+            f"""
+            QMainWindow, QWidget {{
                 background-color: #0f1217;
                 color: #d8dee9;
                 font-family: "Inter", "Segoe UI", "DejaVu Sans", sans-serif;
                 font-size: 12px;
-            }
-            QFrame#TopBar, QFrame#ControlPanel, QFrame#PlotContainer {
+            }}
+            QFrame#TopBar, QFrame#ControlPanel, QFrame#PlotContainer {{
                 background-color: #161b22;
                 border: 1px solid #28303d;
                 border-radius: 6px;
-            }
-            QFrame#HudCard {
+            }}
+            QFrame#HudCard {{
                 background-color: #11161d;
                 border: 1px solid #2b3545;
                 border-left: 4px solid #00e5ff;
                 border-radius: 5px;
-            }
-            QFrame#SubPanel {
+            }}
+            QFrame#SubPanel {{
                 background-color: #11161d;
                 border: 1px solid #262f3d;
                 border-radius: 5px;
-            }
-            QLabel#HudCardTitle {
+            }}
+            QLabel#HudCardTitle {{
                 color: #8b96a8;
                 font-size: 11px;
                 font-weight: 700;
                 letter-spacing: 1px;
-            }
-            QLabel#HudCardUnit {
+            }}
+            QLabel#HudCardUnit {{
                 color: #6b778d;
                 font-size: 11px;
                 font-weight: 600;
-            }
-            QLabel#SectionHeader {
+            }}
+            QLabel#SectionHeader {{
                 color: #9aa5b4;
                 font-size: 11px;
                 font-weight: 700;
                 letter-spacing: 0.8px;
-            }
-            QLabel#TopBarLabel {
+            }}
+            QLabel#TopBarLabel {{
                 color: #8b96a8;
                 font-size: 11px;
                 font-weight: 600;
-            }
-            QLabel#StatValue {
+            }}
+            QLabel#StatValue {{
                 color: #eceff4;
                 font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
                 font-size: 12px;
                 font-weight: 700;
-            }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+            }}
+            QLineEdit {{
                 background-color: #0d1117;
                 border: 1px solid #303947;
                 border-radius: 4px;
-                padding: 4px 8px;
+                padding: 5px 8px;
                 color: #e5e9f0;
-                min-height: 22px;
-            }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                min-height: 24px;
+            }}
+            QComboBox {{
+                background-color: #0d1117;
+                border: 1px solid #303947;
+                border-radius: 4px;
+                padding: 4px 8px 4px 10px;
+                color: #e5e9f0;
+                min-height: 24px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid #48566a;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 24px;
+                background-color: #182230;
+                border-left: 1px solid #303947;
+                border-top-right-radius: 4px;
+                border-bottom-right-radius: 4px;
+            }}
+            QComboBox::drop-down:hover {{
+                background-color: #223044;
+            }}
+            QComboBox::down-arrow {{
+                image: url("{down_arrow}");
+                width: 10px;
+                height: 10px;
+            }}
+            QComboBox::down-arrow:disabled {{
+                image: url("{down_arrow_dis}");
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #11161f;
+                color: #e5e9f0;
                 border: 1px solid #00e5ff;
-            }
-            QProgressBar {
+                border-radius: 4px;
+                selection-background-color: #1e354d;
+                selection-color: #00e5ff;
+                outline: 0px;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 28px;
+                padding: 5px 12px;
+                border-radius: 3px;
+                color: #e5e9f0;
+                background-color: transparent;
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: #1a2736;
+                color: #00e5ff;
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: #1e354d;
+                color: #00e5ff;
+                font-weight: 700;
+            }}
+            QSpinBox, QDoubleSpinBox {{
+                background-color: #0d1117;
+                border: 1px solid #303947;
+                border-radius: 4px;
+                padding: 4px 24px 4px 8px;
+                color: #e5e9f0;
+                min-height: 24px;
+                min-width: 68px;
+            }}
+            QSpinBox:hover, QDoubleSpinBox:hover {{
+                border: 1px solid #48566a;
+            }}
+            QSpinBox::up-button, QDoubleSpinBox::up-button {{
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 22px;
+                background-color: #182230;
+                border-left: 1px solid #303947;
+                border-bottom: 1px solid #303947;
+                border-top-right-radius: 4px;
+            }}
+            QSpinBox::down-button, QDoubleSpinBox::down-button {{
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 22px;
+                background-color: #182230;
+                border-left: 1px solid #303947;
+                border-bottom-right-radius: 4px;
+            }}
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+                background-color: #24344d;
+            }}
+            QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+            QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{
+                background-color: #00e5ff;
+            }}
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+                image: url("{up_arrow}");
+                width: 10px;
+                height: 10px;
+            }}
+            QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{
+                image: url("{up_arrow_dis}");
+            }}
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+                image: url("{down_arrow}");
+                width: 10px;
+                height: 10px;
+            }}
+            QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+                image: url("{down_arrow_dis}");
+            }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+                border: 1px solid #00e5ff;
+            }}
+            QProgressBar {{
                 background-color: #0b0e13;
                 border: 1px solid #2c3545;
                 border-radius: 4px;
@@ -289,15 +443,15 @@ class MainWin(QMainWindow):
                 color: #e5e9f0;
                 font-weight: bold;
                 min-height: 16px;
-            }
-            QProgressBar::chunk {
+            }}
+            QProgressBar::chunk {{
                 background-color: qlineargradient(
                     x1:0, y1:0, x2:1, y2:0,
                     stop:0 #00b0ff, stop:1 #00e676
                 );
                 border-radius: 3px;
-            }
-            QPushButton#ActionButton, QPushButton#CenterTraceButton {
+            }}
+            QPushButton#ActionButton, QPushButton#CenterTraceButton {{
                 background-color: #1c2430;
                 color: #00e5ff;
                 border: 1px solid #2f3e52;
@@ -305,12 +459,12 @@ class MainWin(QMainWindow):
                 padding: 6px 10px;
                 font-size: 11px;
                 font-weight: 700;
-            }
-            QPushButton#ActionButton:hover, QPushButton#CenterTraceButton:hover {
+            }}
+            QPushButton#ActionButton:hover, QPushButton#CenterTraceButton:hover {{
                 background-color: #253142;
                 border-color: #00e5ff;
-            }
-            QPushButton#CollapsibleButton {
+            }}
+            QPushButton#CollapsibleButton {{
                 background-color: #151c25;
                 color: #c8d1de;
                 border: 1px solid #2b3545;
@@ -319,12 +473,12 @@ class MainWin(QMainWindow):
                 font-size: 11px;
                 font-weight: 700;
                 text-align: left;
-            }
-            QPushButton#CollapsibleButton:hover {
+            }}
+            QPushButton#CollapsibleButton:hover {{
                 border-color: #00e5ff;
                 color: #ffffff;
-            }
-            QPushButton#StartButton {
+            }}
+            QPushButton#StartButton {{
                 background-color: #00c853;
                 color: #08120c;
                 border: 1px solid #00e676;
@@ -333,16 +487,16 @@ class MainWin(QMainWindow):
                 font-size: 13px;
                 font-weight: 800;
                 letter-spacing: 1px;
-            }
-            QPushButton#StartButton:hover {
+            }}
+            QPushButton#StartButton:hover {{
                 background-color: #00e676;
-            }
-            QPushButton#StartButton:disabled {
+            }}
+            QPushButton#StartButton:disabled {{
                 background-color: #1e3326;
                 color: #556b5d;
                 border-color: #294233;
-            }
-            QPushButton#StopButton {
+            }}
+            QPushButton#StopButton {{
                 background-color: #d50000;
                 color: #ffffff;
                 border: 1px solid #ff1744;
@@ -351,40 +505,69 @@ class MainWin(QMainWindow):
                 font-size: 13px;
                 font-weight: 800;
                 letter-spacing: 1px;
-            }
-            QPushButton#StopButton:hover {
+            }}
+            QPushButton#StopButton:hover {{
                 background-color: #ff1744;
-            }
-            QPushButton#StopButton:disabled {
+            }}
+            QPushButton#StopButton:disabled {{
                 background-color: #381a1e;
                 color: #6e4f53;
                 border-color: #4a2328;
-            }
-            QTableWidget {
+            }}
+            QTableWidget {{
                 background-color: #0d1117;
                 border: 1px solid #262f3d;
                 gridline-color: #1f2631;
                 color: #d8dee9;
                 font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
                 font-size: 11px;
-            }
-            QHeaderView::section {
+            }}
+            QHeaderView::section {{
                 background-color: #161b22;
                 color: #8b96a8;
                 border: 1px solid #262f3d;
                 padding: 3px 4px;
                 font-size: 10px;
                 font-weight: 700;
-            }
-            QSplitter::handle {
+            }}
+            QSplitter::handle {{
                 background-color: #1f2631;
+            }}
+            QSplitter::handle:horizontal {{
                 width: 4px;
-            }
+            }}
+            QSplitter::handle:vertical {{
+                height: 4px;
+            }}
             """
         )
 
+    def _configure_combo_box(self, combo: QComboBox, min_width: int = 90) -> None:
+        """Configure a QComboBox with a QListView popup and sufficient item space on macOS."""
+        list_view = QListView(combo)
+        list_view.setSpacing(2)
+        list_view.setUniformItemSizes(True)
+        combo.setView(list_view)
+        combo.setItemDelegate(ComboPopupItemDelegate(combo))
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setMinimumWidth(min_width)
+        self._sync_combo_popup_width(combo, min_width)
+
+    @staticmethod
+    def _sync_combo_popup_width(combo: QComboBox, min_width: int = 90) -> None:
+        """Ensure both the combo box and its dropdown popup fit the longest option text."""
+        fm = combo.fontMetrics()
+        max_text_w = max(
+            (fm.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())),
+            default=min_width,
+        )
+        target_w = max(min_width, max_text_w + 52)
+        combo.setMinimumWidth(target_w)
+        if combo.view() is not None:
+            combo.view().setMinimumWidth(target_w + 16)
+
     def _build_ui(self) -> None:
-        """Construct the Top Bar and 3-column Splitter layout."""
+        """Construct the Top Bar, Left Control Panel, and Transposed Graph Panels."""
         central = QWidget(self)
         self.setCentralWidget(central)
 
@@ -403,7 +586,7 @@ class MainWin(QMainWindow):
         self.lbl_test_name = QLabel()
         self.lbl_test_name.setObjectName("TopBarLabel")
         self.txt_test_name = QLineEdit()
-        self.txt_test_name.setMinimumWidth(165)
+        self.txt_test_name.setMinimumWidth(150)
         self.txt_test_name.setText("Caliber-Test-01")
 
         # Caliber Preset
@@ -411,6 +594,7 @@ class MainWin(QMainWindow):
         self.lbl_caliber.setObjectName("TopBarLabel")
         self.cmb_caliber = QComboBox()
         self.cmb_caliber.addItems(list(CALIBER_PRESETS.keys()))
+        self._configure_combo_box(self.cmb_caliber, min_width=185)
         self.cmb_caliber.setCurrentText("ETA 2824-2 / SW200")
         self.cmb_caliber.currentTextChanged.connect(self._on_caliber_changed)
 
@@ -420,6 +604,7 @@ class MainWin(QMainWindow):
         self.cmb_bph = QComboBox()
         for bph in (18000, 21600, 25200, 28800, 36000):
             self.cmb_bph.addItem(str(bph), bph)
+        self._configure_combo_box(self.cmb_bph, min_width=95)
         self.cmb_bph.setCurrentText("28800")
 
         # Lift Angle
@@ -437,12 +622,14 @@ class MainWin(QMainWindow):
         self.lbl_position.setObjectName("TopBarLabel")
         self.cmb_position = QComboBox()
         self.cmb_position.addItems(["DU", "DD", "CU", "CD", "CL", "CR"])
+        self._configure_combo_box(self.cmb_position, min_width=78)
 
         # IN Device
         self.lbl_device = QLabel()
         self.lbl_device.setObjectName("TopBarLabel")
         self.cmb_device = QComboBox()
         self._populate_audio_devices()
+        self._configure_combo_box(self.cmb_device, min_width=230)
 
         # Sample Rate
         self.lbl_srate = QLabel()
@@ -450,6 +637,7 @@ class MainWin(QMainWindow):
         self.cmb_srate = QComboBox()
         self.cmb_srate.addItem("48 kHz", 48000)
         self.cmb_srate.addItem("96 kHz", 96000)
+        self._configure_combo_box(self.cmb_srate, min_width=96)
         self.cmb_srate.setCurrentIndex(1)
 
         # Stabilization time
@@ -474,6 +662,7 @@ class MainWin(QMainWindow):
         self.cmb_lang = QComboBox()
         self.cmb_lang.addItem("EN", "en")
         self.cmb_lang.addItem("ES", "es")
+        self._configure_combo_box(self.cmb_lang, min_width=74)
         idx_lang = 0 if self.translator.locale == "en" else 1
         self.cmb_lang.setCurrentIndex(idx_lang)
         self.cmb_lang.currentIndexChanged.connect(self._on_language_changed)
@@ -499,7 +688,7 @@ class MainWin(QMainWindow):
         top_layout.addStretch()
         root_layout.addWidget(self.top_bar)
 
-        # 2. Main Content Area (QHBoxLayout with 3-column QSplitter)
+        # 2. Main Content Area (Left Control Panel + Right Transposed Graphs Area)
         content_layout = QHBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -673,7 +862,11 @@ class MainWin(QMainWindow):
         btn_layout.addWidget(self.btn_stop)
         left_layout.addLayout(btn_layout)
 
-        # --- Center Column: Paper Tape Trace (Horizontal Time on X, Deviation/Rate on Y) ---
+        # --- Right Graphs Area: Vertical Splitter (Top: Paper Tape, Bottom: Oscilloscope + Audio Waveform) ---
+        self.graphs_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.graphs_splitter.setChildrenCollapsible(False)
+
+        # 2A. Top Graph Panel: Paper Tape Trace (Horizontal Time on X, Deviation/Rate on Y)
         self.center_container = QFrame()
         self.center_container.setObjectName("PlotContainer")
         center_layout = QVBoxLayout(self.center_container)
@@ -693,32 +886,32 @@ class MainWin(QMainWindow):
         )
         self.paper_tape_plot.addItem(self.tape_zero_line)
 
-        # Static horizontal translucent green COSC limit lines (-4 s/d and +6 s/d) on Y-axis
+        # Static horizontal translucent green COSC limit lines (-4 and +6) on Y-axis
         cosc_pen = pg.mkPen(color=(0, 230, 118, 135), width=1.8, style=Qt.PenStyle.DashLine)
         self.cosc_lower_line = pg.InfiniteLine(
             pos=self.COSC_MIN_SPD,
             angle=0,
             pen=cosc_pen,
-            label="COSC -4 s/d",
-            labelOpts={"position": 0.08, "color": (0, 230, 118, 200)},
+            label="-4",
+            labelOpts={"position": 0.97, "color": (0, 230, 118, 220)},
         )
         self.cosc_upper_line = pg.InfiniteLine(
             pos=self.COSC_MAX_SPD,
             angle=0,
             pen=cosc_pen,
-            label="COSC +6 s/d",
-            labelOpts={"position": 0.08, "color": (0, 230, 118, 200)},
+            label="+6",
+            labelOpts={"position": 0.97, "color": (0, 230, 118, 220)},
         )
         self.paper_tape_plot.addItem(self.cosc_lower_line)
         self.paper_tape_plot.addItem(self.cosc_upper_line)
 
-        # Two parallel traces (even/odd beats) using triangle symbols ('t' and 't1')
+        # Two parallel traces (even/odd beats) using circular point symbols ('o')
         self.tape_curve_even = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#00e5ff", width=1.5),
-            symbol="t",
-            symbolSize=7,
+            pen=pg.mkPen(color="#00e5ff", width=1.8),
+            symbol="o",
+            symbolSize=5,
             symbolBrush="#00e5ff",
             symbolPen=None,
             name="Tick (Even)",
@@ -726,9 +919,9 @@ class MainWin(QMainWindow):
         self.tape_curve_odd = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#ffab00", width=1.5),
-            symbol="t1",
-            symbolSize=7,
+            pen=pg.mkPen(color="#ffab00", width=1.8),
+            symbol="o",
+            symbolSize=5,
             symbolBrush="#ffab00",
             symbolPen=None,
             name="Tock (Odd)",
@@ -746,7 +939,11 @@ class MainWin(QMainWindow):
         tape_footer_layout.addWidget(self.btn_center_trace)
         center_layout.addLayout(tape_footer_layout)
 
-        # --- Right Column: Real-Time Oscilloscope (PlotWidget) ---
+        # 2B. Bottom Graphs Row: Horizontal Splitter with (1) Oscilloscope and (2) Audio Waveform
+        self.bottom_graphs_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.bottom_graphs_splitter.setChildrenCollapsible(False)
+
+        # Bottom-Left: Real-Time Escapement Oscilloscope (P1 / P2 / P3)
         self.right_container = QFrame()
         self.right_container.setObjectName("PlotContainer")
         right_layout = QVBoxLayout(self.right_container)
@@ -793,14 +990,49 @@ class MainWin(QMainWindow):
 
         right_layout.addWidget(self.oscilloscope_plot)
 
-        # Add all 3 columns to the splitter
+        # Bottom-Right: Real-Time Audio Waveform Representation
+        self.waveform_container = QFrame()
+        self.waveform_container.setObjectName("PlotContainer")
+        waveform_layout = QVBoxLayout(self.waveform_container)
+        waveform_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.waveform_plot = pg.PlotWidget()
+        self.waveform_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.waveform_plot.setYRange(-1.1, 1.1)
+
+        self.waveform_zero_line = pg.InfiniteLine(
+            pos=0.0,
+            angle=0,
+            pen=pg.mkPen(color="#2e3846", width=1.0, style=Qt.PenStyle.DashLine),
+        )
+        self.waveform_plot.addItem(self.waveform_zero_line)
+
+        self.audio_waveform_curve = self.waveform_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen(color="#00e676", width=1.3),
+        )
+        waveform_layout.addWidget(self.waveform_plot)
+
+        self.bottom_graphs_splitter.addWidget(self.right_container)
+        self.bottom_graphs_splitter.addWidget(self.waveform_container)
+        self.bottom_graphs_splitter.setStretchFactor(0, 1)
+        self.bottom_graphs_splitter.setStretchFactor(1, 1)
+        self.bottom_graphs_splitter.setSizes([515, 515])
+
+        # Stack Paper Tape on top and (Oscilloscope + Audio Waveform) on bottom
+        self.graphs_splitter.addWidget(self.center_container)
+        self.graphs_splitter.addWidget(self.bottom_graphs_splitter)
+        self.graphs_splitter.setStretchFactor(0, 1)
+        self.graphs_splitter.setStretchFactor(1, 1)
+        self.graphs_splitter.setSizes([380, 380])
+
+        # Add Left Panel and Right Transposed Graphs Splitter to the main splitter
         self.splitter.addWidget(self.left_panel)
-        self.splitter.addWidget(self.center_container)
-        self.splitter.addWidget(self.right_container)
+        self.splitter.addWidget(self.graphs_splitter)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setStretchFactor(2, 1)
-        self.splitter.setSizes([330, 515, 515])
+        self.splitter.setSizes([330, 1030])
 
         content_layout.addWidget(self.splitter)
         root_layout.addLayout(content_layout, stretch=1)
@@ -917,6 +1149,7 @@ class MainWin(QMainWindow):
 
         if self.cmb_device.count() > 0:
             self.cmb_device.setItemText(0, tr("synthetic_device"))
+            self._sync_combo_popup_width(self.cmb_device, min_width=230)
 
         self.card_rate.set_title(tr("rate"))
         self.card_beat_error.set_title(tr("beat_error"))
@@ -952,6 +1185,10 @@ class MainWin(QMainWindow):
         self.oscilloscope_plot.setLabel("bottom", tr("oscilloscope_x"))
         self.oscilloscope_plot.setLabel("left", tr("oscilloscope_y"))
 
+        self.waveform_plot.setTitle(tr("waveform_title"), color="#c8d1de", size="11pt")
+        self.waveform_plot.setLabel("bottom", tr("waveform_x"))
+        self.waveform_plot.setLabel("left", tr("waveform_y"))
+
     def current_watch_config(self) -> WatchConfig:
         """Build a `WatchConfig` instance from the active Top Bar controls."""
         bph = int(self.cmb_bph.currentData() or int(self.cmb_bph.currentText()))
@@ -974,6 +1211,7 @@ class MainWin(QMainWindow):
         self.tape_curve_odd.setData([], [])
         self.osc_wave_curve.setData([], [])
         self.osc_impulse_markers.setData([], [])
+        self.audio_waveform_curve.setData([], [])
 
         duration_s = float(self.spn_duration.value())
         stab_s = float(self.spn_stab.value())
@@ -1031,8 +1269,9 @@ class MainWin(QMainWindow):
         beats: list[BeatEvent],
         elapsed_s: float,
         snr_db: float,
+        audio_chunk: np.ndarray | None = None,
     ) -> None:
-        """Update HUD cards, statistics, horizontal Witschi paper tape, and P1/P2/P3 oscilloscope."""
+        """Update HUD cards, statistics, horizontal paper tape, oscilloscope, and audio waveform."""
         self._last_telemetry = telemetry
         stab_s = float(self.spn_stab.value())
 
@@ -1078,11 +1317,11 @@ class MainWin(QMainWindow):
             self.tape_curve_even.setData(self._tape_times_even, self._tape_rate_even)
             self.tape_curve_odd.setData(self._tape_times_odd, self._tape_rate_odd)
 
-        # Update Right Column Oscilloscope with the latest BeatEvent
+        # Update Bottom-Left Oscilloscope and Bottom-Right Audio Waveform
+        fs = self.current_watch_config().sample_rate
         if beats:
             latest_beat = beats[-1]
             wave = latest_beat.raw_waveform
-            fs = self.current_watch_config().sample_rate
             if len(wave) > 0:
                 peak_abs = float(np.max(np.abs(wave))) or 1.0
                 norm_wave = wave / peak_abs
@@ -1122,6 +1361,30 @@ class MainWin(QMainWindow):
                     },
                 ]
                 self.osc_impulse_markers.setData(spots)
+
+        # Update Bottom-Right Audio Waveform Graph (peak-preserving decimation to avoid aliasing)
+        wave_stream = audio_chunk if (audio_chunk is not None and len(audio_chunk) > 0) else (
+            beats[-1].raw_waveform if beats else None
+        )
+        if wave_stream is not None and len(wave_stream) > 0:
+            max_amp = float(np.max(np.abs(wave_stream))) or 1.0
+            norm_stream = wave_stream / max_amp
+            n_pts = len(norm_stream)
+            max_bins = 2000
+            if n_pts > max_bins * 2:
+                bin_size = n_pts // max_bins
+                n_trim = bin_size * max_bins
+                reshaped = norm_stream[:n_trim].reshape(max_bins, bin_size)
+                y_min = np.min(reshaped, axis=1)
+                y_max = np.max(reshaped, axis=1)
+                y_dec = np.empty(max_bins * 2, dtype=np.float64)
+                y_dec[0::2] = y_min
+                y_dec[1::2] = y_max
+                t_stream_ms = np.linspace(0.0, (n_trim / fs) * 1000.0, max_bins * 2)
+                self.audio_waveform_curve.setData(t_stream_ms, y_dec)
+            else:
+                t_stream_ms = (np.arange(n_pts, dtype=np.float64) / fs) * 1000.0
+                self.audio_waveform_curve.setData(t_stream_ms, norm_stream)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Ensure background worker thread is cleanly stopped before window closes."""
