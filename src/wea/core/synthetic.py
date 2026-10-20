@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 
 from wea.core.models import WatchConfig
+from wea.utils.logger_setup import LoggerSetup
+
+logger = LoggerSetup.setup_logger(__name__)
 
 
 class SyntheticEscapeGenerator:
@@ -22,6 +25,13 @@ class SyntheticEscapeGenerator:
         """Initialize the generator with a WatchConfig and optional random seed."""
         self.config = config
         self.rng = np.random.default_rng(seed)
+        logger.debug(
+            "SyntheticEscapeGenerator initialized (bph=%d, lift=%.1f, fs=%d, seed=%s)",
+            config.bph,
+            config.lift_angle,
+            config.sample_rate,
+            seed,
+        )
 
     def compute_p1_p3_delay(
         self, amplitude_deg: float, actual_beat_period: float | None = None
