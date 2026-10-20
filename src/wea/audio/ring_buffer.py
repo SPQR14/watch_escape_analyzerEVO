@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from wea.utils.logger_setup import LoggerSetup
 import threading
+
 import numpy as np
+
+from wea.utils.logger_setup import LoggerSetup
 
 logger = LoggerSetup.setup_logger(__name__)
 
@@ -67,13 +69,13 @@ class AudioRingBuffer:
         with self._lock:
             if n >= self._capacity:
                 # Keep only the most recent `capacity` samples
-                self._buffer[:] = samples[-self._capacity:]
+                self._buffer[:] = samples[-self._capacity :]
                 self._write_pos = 0
                 self._size = self._capacity
                 return
 
             first_part = min(n, self._capacity - self._write_pos)
-            self._buffer[self._write_pos:self._write_pos + first_part] = samples[:first_part]
+            self._buffer[self._write_pos : self._write_pos + first_part] = samples[:first_part]
 
             second_part = n - first_part
             if second_part > 0:
@@ -97,7 +99,7 @@ class AudioRingBuffer:
 
             start_pos = (self._write_pos - count) % self._capacity
             if start_pos + count <= self._capacity:
-                return self._buffer[start_pos:start_pos + count].copy()
+                return self._buffer[start_pos : start_pos + count].copy()
 
             first_chunk = self._buffer[start_pos:]
             second_chunk = self._buffer[: self._write_pos]
