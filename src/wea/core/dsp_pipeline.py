@@ -60,9 +60,15 @@ class EscapeDSPPipeline:
     def filter_signal(self, raw_signal: np.ndarray) -> np.ndarray:
         """Apply zero-phase forward-backward SOS Butterworth \
             bandpass filter."""
-        logger.info(
-            "Filtering raw signal with bandpass %.1f Hz - %.1f Hz (order)")
+        logger.debug(
+            "Filtering raw signal (%d samples) with bandpass %.1f Hz - %.1f Hz (order %d)",
+            len(raw_signal),
+            self.LOWCUT_HZ,
+            self.HIGHCUT_HZ,
+            self.FILTER_ORDER,
+        )
         if len(raw_signal) == 0:
+            logger.warning("filter_signal received an empty signal array")
             return raw_signal.copy()
         return sosfiltfilt(self._sos, raw_signal)
 
@@ -208,6 +214,10 @@ class EscapeDSPPipeline:
         beats = self.extract_beats(filtered)
 
         if len(beats) < 3:
+            logger.warning(
+                "Insufficient beats detected (%d < 3) for telemetry computation",
+                len(beats),
+            )
             return (
                 TelemetryResult(
                     rate_spd=0.0,
@@ -281,6 +291,14 @@ class EscapeDSPPipeline:
             beat_error_ms=float(beat_error_ms),
             amplitude_deg=float(amplitude_deg),
             confidence=confidence,
+        )
+        logger.debug(
+            "DSP telemetry computed: rate=%+.2f s/d, BE=%.3f ms, amp=%.1f deg, conf=%.2f (%d beats)",
+            telemetry.rate_spd,
+            telemetry.beat_error_ms,
+            telemetry.amplitude_deg,
+            telemetry.confidence,
+            len(beats),
         )
         return telemetry, beats
 

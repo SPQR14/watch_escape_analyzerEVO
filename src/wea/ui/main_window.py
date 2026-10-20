@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 import time
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QSize, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QRectF, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPageLayout, QPageSize
+from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -35,24 +38,22 @@ from wea.core.dsp_pipeline import EscapeDSPPipeline
 from wea.core.models import BeatEvent, TelemetryResult, WatchConfig
 from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.i18n.translator import Translator
+from wea.utils.audio_io import (
+    is_flac_supported,
+    preferred_audio_format,
+    save_audio_recording,
+)
+from wea.utils.logger_setup import LoggerSetup
+from wea.utils.watch_db import load_watch_db
+
+logger = LoggerSetup.setup_logger(__name__)
 
 # Configure PyQtGraph global options for crisp anti-aliased industrial plotting
 pg.setConfigOptions(antialias=True, background="#0d1015", foreground="#9aa5b4")
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
-
-CALIBER_PRESETS: dict[str, tuple[int, float]] = {
-    "Custom": (28800, 52.0),
-    "Seiko NH35 / 4R36": (21600, 53.0),
-    "Miyota 9015": (28800, 51.0),
-    "ETA 2824-2 / SW200": (28800, 50.0),
-    "Rolex 3135": (28800, 52.0),
-    "Omega 1861": (21600, 50.0),
-    "Omega 2500 Co-Axial": (25200, 38.0),
-    "Zenith El Primero 400": (36000, 52.0),
-    "ETA 6497-1 (Unitas)": (18000, 44.0),
-}
+CALIBER_PRESETS: dict[str, tuple[int, float]] = load_watch_db()
 
 POSITION_VARIATION: dict[str, tuple[float, float, float]] = {
     "DU": (+4.5, 0.35, 282.0),
@@ -81,6 +82,7 @@ class SyntheticTelemetryWorker(QThread):
     """
 
     telemetry_updated = pyqtSignal(object, object, float, float, object)
+    recording_ready = pyqtSignal(object, int)
     session_finished = pyqtSignal()
 
     def __init__(
@@ -97,84 +99,128 @@ class SyntheticTelemetryWorker(QThread):
         self.stabilization_s = float(stabilization_s)
         self.duration_s = float(duration_s)
         self._running = False
+        logger.info(
+            "SyntheticTelemetryWorker initialized (position=%s, stab=%.1fs, duration=%.1fs, bph=%d, fs=%d)",
+            self.position,
+            self.stabilization_s,
+            self.duration_s,
+            self.config.bph,
+            self.config.sample_rate,
+        )
 
     def stop(self) -> None:
         """Request cooperative termination of the worker loop."""
+        logger.info("Stopping SyntheticTelemetryWorker thread requested")
         self._running = False
 
     def run(self) -> None:
         """Continuously synthesize, buffer, and process sliding acoustic windows."""
+        logger.info("Audio processing worker thread started")
         self._running = True
         fs = self.config.sample_rate
         window_seconds = 3.0
-        ring_buffer = AudioRingBuffer(capacity=int(window_seconds * fs))
-        pipeline = EscapeDSPPipeline(config=self.config)
+        target_record_samples = int(round(self.duration_s * fs))
+        recorded_chunks: list[np.ndarray] = []
+        recorded_count = 0
 
-        base_rate, base_be, base_amp = POSITION_VARIATION.get(
-            self.position, (+4.5, 0.35, 280.0)
-        )
-        rng = np.random.default_rng(int(time.time() * 1000) % (2**31 - 1))
+        try:
+            ring_buffer = AudioRingBuffer(capacity=int(window_seconds * fs))
+            pipeline = EscapeDSPPipeline(config=self.config)
 
-        start_wall = time.monotonic()
-        step_interval = 0.25
-        step_idx = 0
-        chunk_samples = int(0.6 * fs)
-
-        while self._running:
-            elapsed = time.monotonic() - start_wall
-            if elapsed > self.duration_s + self.stabilization_s:
-                break
-
-            inst_amp = base_amp + float(rng.normal(0.0, 2.5))
-            snr_db = 32.0 + float(rng.normal(0.0, 1.5))
-
-            # Synthesize a fresh acoustic window per step (with constant ground-truth rate/BE
-            # so the paper tape draws a straight line while the oscilloscope & audio waveform move live)
-            gen = SyntheticEscapeGenerator(config=self.config, seed=1000 + step_idx)
-            synth_signal = gen.generate(
-                duration_s=window_seconds,
-                true_rate_spd=base_rate,
-                true_beat_error_ms=base_be,
-                true_amplitude_deg=inst_amp,
-                snr_db=snr_db,
+            base_rate, base_be, base_amp = POSITION_VARIATION.get(
+                self.position, (+4.5, 0.35, 280.0)
             )
+            rng = np.random.default_rng(int(time.time() * 1000) % (2**31 - 1))
 
-            ring_buffer.write(synth_signal)
-            window_data = ring_buffer.read_latest(int(window_seconds * fs))
-            telemetry, beats = pipeline.analyze(window_data)
+            start_wall = time.monotonic()
+            step_interval = 0.25
+            step_idx = 0
+            chunk_samples = int(0.6 * fs)
+            step_record_samples = max(1, int(round(step_interval * fs)))
 
-            # Apply live acoustic micro-modulation to the displayed beat waveform
-            # so the real-time oscilloscope visibly animates on every frame
-            if beats:
-                last_b = beats[-1]
-                w = last_b.raw_waveform
-                if len(w) > 0:
-                    t_local = np.arange(len(w), dtype=np.float64) / fs
-                    phase_shift = float(rng.uniform(0.0, 2.0 * np.pi))
-                    mod = 1.0 + 0.18 * np.sin(2.0 * np.pi * 1100.0 * t_local + phase_shift)
-                    jitter_noise = rng.normal(0.0, 0.04 * ( float(np.max(np.abs(w))) or 1.0 ), size=len(w))
-                    beats[-1] = BeatEvent(
-                        timestamp_p1=last_b.timestamp_p1,
-                        timestamp_p2=last_b.timestamp_p2,
-                        timestamp_p3=last_b.timestamp_p3,
-                        peak_energy=last_b.peak_energy,
-                        raw_waveform=(w * mod) + jitter_noise,
+            while self._running:
+                elapsed = time.monotonic() - start_wall
+                if elapsed > self.duration_s + self.stabilization_s:
+                    break
+
+                inst_amp = base_amp + float(rng.normal(0.0, 2.5))
+                snr_db = 32.0 + float(rng.normal(0.0, 1.5))
+
+                # Synthesize a fresh acoustic window per step (with constant ground-truth rate/BE
+                # so the paper tape draws a straight line while the oscilloscope & audio waveform move live)
+                gen = SyntheticEscapeGenerator(config=self.config, seed=1000 + step_idx)
+                synth_signal = gen.generate(
+                    duration_s=window_seconds,
+                    true_rate_spd=base_rate,
+                    true_beat_error_ms=base_be,
+                    true_amplitude_deg=inst_amp,
+                    snr_db=snr_db,
+                )
+
+                ring_buffer.write(synth_signal)
+                window_data = ring_buffer.read_latest(int(window_seconds * fs))
+                telemetry, beats = pipeline.analyze(window_data)
+
+                if elapsed >= self.stabilization_s and recorded_count < target_record_samples:
+                    need = min(step_record_samples, target_record_samples - recorded_count)
+                    recorded_chunks.append(synth_signal[:need].copy())
+                    recorded_count += need
+
+                # Apply live acoustic micro-modulation to the displayed beat waveform
+                # so the real-time oscilloscope visibly animates on every frame
+                if beats:
+                    last_b = beats[-1]
+                    w = last_b.raw_waveform
+                    if len(w) > 0:
+                        t_local = np.arange(len(w), dtype=np.float64) / fs
+                        phase_shift = float(rng.uniform(0.0, 2.0 * np.pi))
+                        mod = 1.0 + 0.18 * np.sin(2.0 * np.pi * 1100.0 * t_local + phase_shift)
+                        jitter_noise = rng.normal(
+                            0.0, 0.04 * (float(np.max(np.abs(w))) or 1.0), size=len(w)
+                        )
+                        beats[-1] = BeatEvent(
+                            timestamp_p1=last_b.timestamp_p1,
+                            timestamp_p2=last_b.timestamp_p2,
+                            timestamp_p3=last_b.timestamp_p3,
+                            peak_energy=last_b.peak_energy,
+                            raw_waveform=(w * mod) + jitter_noise,
+                        )
+
+                # Shift window slice per step so the audio waveform scrolls dynamically
+                max_start = max(1, len(window_data) - chunk_samples)
+                start_idx = (step_idx * int(0.035 * fs)) % max_start
+                audio_slice = window_data[start_idx : start_idx + chunk_samples].copy()
+
+                if self._running:
+                    self.telemetry_updated.emit(telemetry, beats, elapsed, snr_db, audio_slice)
+
+                step_idx += 1
+                sleep_deadline = time.monotonic() + step_interval
+                while self._running and time.monotonic() < sleep_deadline:
+                    self.msleep(25)
+
+            if recorded_chunks:
+                full_rec = np.concatenate(recorded_chunks)
+                if len(full_rec) < target_record_samples:
+                    rem_s = (target_record_samples - len(full_rec)) / float(fs)
+                    gen_tail = SyntheticEscapeGenerator(config=self.config, seed=9999)
+                    tail = gen_tail.generate(
+                        duration_s=rem_s + 0.05,
+                        true_rate_spd=base_rate,
+                        true_beat_error_ms=base_be,
+                        true_amplitude_deg=base_amp,
+                        snr_db=32.0,
                     )
-
-            # Shift window slice per step so the audio waveform scrolls dynamically
-            max_start = max(1, len(window_data) - chunk_samples)
-            start_idx = (step_idx * int(0.035 * fs)) % max_start
-            audio_slice = window_data[start_idx : start_idx + chunk_samples].copy()
-
-            if self._running:
-                self.telemetry_updated.emit(telemetry, beats, elapsed, snr_db, audio_slice)
-
-            step_idx += 1
-            sleep_deadline = time.monotonic() + step_interval
-            while self._running and time.monotonic() < sleep_deadline:
-                self.msleep(25)
-
-        self.session_finished.emit()
+                    full_rec = np.concatenate(
+                        [full_rec, tail[: target_record_samples - len(full_rec)]]
+                    )
+                full_rec = full_rec[:target_record_samples]
+                self.recording_ready.emit(full_rec, fs)
+        except Exception as exc:
+            logger.error("Error inside audio processing worker thread: %s", exc, exc_info=True)
+        finally:
+            logger.info("Audio processing worker thread finished")
+            self.session_finished.emit()
 
 
 class HudCard(QFrame):
@@ -205,12 +251,19 @@ class HudCard(QFrame):
         header_layout.addWidget(self.unit_label)
 
         self.value_label = QLabel("---.-")
-        self.value_label.setMinimumHeight(34)
+        self.value_label.setObjectName("HudCardValue")
+        self.value_label.setMinimumHeight(58)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        mono_font = QFont("JetBrains Mono", 22, QFont.Weight.Bold)
+        mono_font = QFont("JetBrains Mono", 39, QFont.Weight.Bold)
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
         self.value_label.setFont(mono_font)
-        self.value_label.setStyleSheet(f"color: {self._accent_color}; padding-bottom: 2px;")
+        self.value_label.setStyleSheet(
+            f'color: {self._accent_color}; '
+            f'font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; '
+            f'font-size: 39pt; '
+            f'font-weight: 800; '
+            f'padding-bottom: 2px;'
+        )
 
         layout.addLayout(header_layout)
         layout.addWidget(self.value_label)
@@ -232,6 +285,7 @@ class MainWin(QMainWindow):
 
     def __init__(self, translator: Translator | None = None) -> None:
         super().__init__()
+        logger.info("Initializing MainWin UI")
         self.translator = translator if translator is not None else Translator("en")
         self.worker: SyntheticTelemetryWorker | None = None
 
@@ -242,18 +296,27 @@ class MainWin(QMainWindow):
         self._tape_times_odd: list[float] = []
         self._tape_rate_odd: list[float] = []
         self._last_telemetry: TelemetryResult | None = None
+        self._session_records: list[dict[str, float | str | int]] = []
 
-        # Saved positional telemetry records (keyed by position: DU, DD, CU, CD, CL, CR)
-        self._saved_positions: dict[str, TelemetryResult] = {
-            "DU": TelemetryResult(rate_spd=+4.4, beat_error_ms=0.35, amplitude_deg=282.0, confidence=0.98),
-            "CU": TelemetryResult(rate_spd=-1.4, beat_error_ms=0.52, amplitude_deg=249.0, confidence=0.96),
-        }
+        # Audio recording state (same duration as test)
+        self._recorded_audio: np.ndarray | None = None
+        self._recorded_sample_rate: int = 96000
+        self._save_audio_on_finish: bool = False
+
+        # Saved positional telemetry records (starts clean with no pre-populated data)
+        self._saved_positions: dict[str, TelemetryResult] = {}
 
         self.setMinimumSize(1360, 840)
         self._apply_industrial_theme()
         self._build_ui()
         self.retranslate_ui()
         self._refresh_global_stats_table()
+        logger.info(
+            "MainWin initialized with default caliber='%s', bph=%s, lift_angle=%.1f",
+            self.cmb_caliber.currentText(),
+            self.cmb_bph.currentText(),
+            self.spn_lift.value(),
+        )
 
     def _apply_industrial_theme(self) -> None:
         """Apply dark industrial test-bench stylesheet with macOS QComboBox & QSpinBox fixes."""
@@ -514,6 +577,35 @@ class MainWin(QMainWindow):
                 color: #6e4f53;
                 border-color: #4a2328;
             }}
+            QPushButton#RecordButton {{
+                background-color: #25161b;
+                color: #ff5252;
+                border: 1px solid #ff1744;
+                border-radius: 5px;
+                padding: 7px 12px;
+                font-size: 12px;
+                font-weight: 800;
+                letter-spacing: 0.8px;
+            }}
+            QPushButton#RecordButton:hover {{
+                background-color: #3b1b23;
+                color: #ff8a80;
+                border-color: #ff5252;
+            }}
+            QPushButton#CoffeeButton {{
+                background-color: #2b2111;
+                color: #ffab00;
+                border: 1px solid #ffab00;
+                border-radius: 5px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QPushButton#CoffeeButton:hover {{
+                background-color: #3d2f18;
+                color: #ffd740;
+                border-color: #ffd740;
+            }}
             QTableWidget {{
                 background-color: #0d1117;
                 border: 1px solid #262f3d;
@@ -595,7 +687,7 @@ class MainWin(QMainWindow):
         self.cmb_caliber = QComboBox()
         self.cmb_caliber.addItems(list(CALIBER_PRESETS.keys()))
         self._configure_combo_box(self.cmb_caliber, min_width=185)
-        self.cmb_caliber.setCurrentText("ETA 2824-2 / SW200")
+        self.cmb_caliber.setCurrentText("Custom")
         self.cmb_caliber.currentTextChanged.connect(self._on_caliber_changed)
 
         # BPH
@@ -605,7 +697,7 @@ class MainWin(QMainWindow):
         for bph in (18000, 21600, 25200, 28800, 36000):
             self.cmb_bph.addItem(str(bph), bph)
         self._configure_combo_box(self.cmb_bph, min_width=95)
-        self.cmb_bph.setCurrentText("28800")
+        self.cmb_bph.setCurrentText("21600")
 
         # Lift Angle
         self.lbl_lift = QLabel()
@@ -686,6 +778,14 @@ class MainWin(QMainWindow):
             top_layout.addLayout(pair)
 
         top_layout.addStretch()
+
+        # Placeholder "Buy me a coffee" button in the top-right corner
+        self.btn_buy_coffee = QPushButton("☕ Buy me a coffee")
+        self.btn_buy_coffee.setObjectName("CoffeeButton")
+        self.btn_buy_coffee.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_buy_coffee.clicked.connect(self._on_buy_coffee_clicked)
+        top_layout.addWidget(self.btn_buy_coffee, alignment=Qt.AlignmentFlag.AlignVCenter)
+
         root_layout.addWidget(self.top_bar)
 
         # 2. Main Content Area (Left Control Panel + Right Transposed Graphs Area)
@@ -752,27 +852,27 @@ class MainWin(QMainWindow):
         stats_grid.setVerticalSpacing(3)
 
         self.lbl_stat_max_key = QLabel()
-        self.lbl_stat_max_val = QLabel("--- s/d")
+        self.lbl_stat_max_val = QLabel("")
         self.lbl_stat_max_val.setObjectName("StatValue")
         self.lbl_stat_max_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.lbl_stat_min_key = QLabel()
-        self.lbl_stat_min_val = QLabel("--- s/d")
+        self.lbl_stat_min_val = QLabel("")
         self.lbl_stat_min_val.setObjectName("StatValue")
         self.lbl_stat_min_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.lbl_stat_delta_key = QLabel()
-        self.lbl_stat_delta_val = QLabel("--- s/d")
+        self.lbl_stat_delta_val = QLabel("")
         self.lbl_stat_delta_val.setObjectName("StatValue")
         self.lbl_stat_delta_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.lbl_stat_mean_key = QLabel()
-        self.lbl_stat_mean_val = QLabel("--- s/d")
+        self.lbl_stat_mean_val = QLabel("")
         self.lbl_stat_mean_val.setObjectName("StatValue")
         self.lbl_stat_mean_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.lbl_stat_elapsed_key = QLabel()
-        self.lbl_stat_elapsed_val = QLabel("00:00.0")
+        self.lbl_stat_elapsed_val = QLabel("")
         self.lbl_stat_elapsed_val.setObjectName("StatValue")
         self.lbl_stat_elapsed_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -791,12 +891,22 @@ class MainWin(QMainWindow):
         stats_layout.addLayout(stats_grid)
         left_layout.addWidget(self.stats_panel)
 
-        # Positional Test Management: "Guardar Posición" & Collapsible "Estadísticas Globales (Delta Posicional)"
+        # Positional Test Management & CSV Export: "Guardar Posición", "Guardar CSV" & Collapsible "Estadísticas Globales"
+        pos_csv_layout = QHBoxLayout()
+        pos_csv_layout.setSpacing(6)
         self.btn_save_position = QPushButton()
         self.btn_save_position.setObjectName("ActionButton")
         self.btn_save_position.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save_position.clicked.connect(self.save_current_position)
-        left_layout.addWidget(self.btn_save_position)
+
+        self.btn_save_csv = QPushButton()
+        self.btn_save_csv.setObjectName("ActionButton")
+        self.btn_save_csv.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_csv.clicked.connect(lambda: self.save_results_csv())
+
+        pos_csv_layout.addWidget(self.btn_save_position)
+        pos_csv_layout.addWidget(self.btn_save_csv)
+        left_layout.addLayout(pos_csv_layout)
 
         self.btn_global_stats = QPushButton()
         self.btn_global_stats.setObjectName("CollapsibleButton")
@@ -826,12 +936,12 @@ class MainWin(QMainWindow):
         summary_grid.setHorizontalSpacing(8)
         summary_grid.setVerticalSpacing(2)
         self.lbl_global_mean_key = QLabel()
-        self.lbl_global_mean_val = QLabel("--- s/d")
+        self.lbl_global_mean_val = QLabel("")
         self.lbl_global_mean_val.setObjectName("StatValue")
         self.lbl_global_mean_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.lbl_global_delta_key = QLabel()
-        self.lbl_global_delta_val = QLabel("--- s/d")
+        self.lbl_global_delta_val = QLabel("")
         self.lbl_global_delta_val.setObjectName("StatValue")
         self.lbl_global_delta_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -842,7 +952,22 @@ class MainWin(QMainWindow):
         gstats_layout.addLayout(summary_grid)
 
         left_layout.addWidget(self.global_stats_container)
+
+        # Button right beneath the Global Statistics panel to export only global stats & positional delta
+        self.btn_export_test_results = QPushButton()
+        self.btn_export_test_results.setObjectName("ActionButton")
+        self.btn_export_test_results.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_export_test_results.clicked.connect(lambda: self.export_test_results())
+        left_layout.addWidget(self.btn_export_test_results)
+
         left_layout.addStretch()
+
+        # Audio Recording Button (same duration as test, default FLAC or Vorbis)
+        self.btn_record = QPushButton()
+        self.btn_record.setObjectName("RecordButton")
+        self.btn_record.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_record.clicked.connect(lambda: self.record_audio())
+        left_layout.addWidget(self.btn_record)
 
         # Start / Stop Buttons
         btn_layout = QHBoxLayout()
@@ -928,10 +1053,24 @@ class MainWin(QMainWindow):
         )
         center_layout.addWidget(self.paper_tape_plot, stretch=1)
 
-        # Footer bar right beneath Paper Tape Trace with the "Center Trace" button
+        # Footer bar right beneath Paper Tape Trace with "Center Trace", "Export Traces", and "Print Traces"
         tape_footer_layout = QHBoxLayout()
         tape_footer_layout.setContentsMargins(2, 0, 2, 0)
+        tape_footer_layout.setSpacing(6)
         tape_footer_layout.addStretch()
+
+        self.btn_export_traces = QPushButton()
+        self.btn_export_traces.setObjectName("CenterTraceButton")
+        self.btn_export_traces.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_export_traces.clicked.connect(lambda: self.export_traces())
+        tape_footer_layout.addWidget(self.btn_export_traces)
+
+        self.btn_print_traces = QPushButton()
+        self.btn_print_traces.setObjectName("CenterTraceButton")
+        self.btn_print_traces.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_print_traces.clicked.connect(lambda: self.print_traces())
+        tape_footer_layout.addWidget(self.btn_print_traces)
+
         self.btn_center_trace = QPushButton()
         self.btn_center_trace.setObjectName("CenterTraceButton")
         self.btn_center_trace.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1041,6 +1180,7 @@ class MainWin(QMainWindow):
         """Populate input audio device selector with synthetic generator and hardware inputs."""
         self.cmb_device.clear()
         self.cmb_device.addItem(self.translator.tr("synthetic_device"), "synthetic")
+        hw_count = 0
         try:
             import sounddevice as sd
 
@@ -1049,20 +1189,29 @@ class MainWin(QMainWindow):
                 if isinstance(dev, dict) and dev.get("max_input_channels", 0) > 0:
                     name = dev.get("name", f"Device {idx}")
                     self.cmb_device.addItem(f"[{idx}] {name}", idx)
-        except Exception:
-            pass
+                    hw_count += 1
+            logger.info("Initialized audio input devices: 1 synthetic + %d hardware inputs", hw_count)
+        except Exception as exc:
+            logger.warning("Could not query hardware audio devices: %s", exc)
 
     def _on_caliber_changed(self, caliber_name: str) -> None:
         """Update BPH and Lift Angle automatically when a caliber preset is selected."""
-        if caliber_name in CALIBER_PRESETS and caliber_name != "Custom":
+        if caliber_name in CALIBER_PRESETS:
             bph, lift_angle = CALIBER_PRESETS[caliber_name]
             self.cmb_bph.setCurrentText(str(bph))
             self.spn_lift.setValue(lift_angle)
+            logger.info(
+                "Caliber selection changed to '%s' (bph=%d, lift_angle=%.1f deg)",
+                caliber_name,
+                bph,
+                lift_angle,
+            )
 
     def _on_language_changed(self, index: int) -> None:
         """Switch active language in Translator and refresh all UI texts."""
         lang_code = self.cmb_lang.itemData(index)
         if lang_code:
+            logger.info("UI language changed to '%s'", lang_code)
             self.translator.set_locale(str(lang_code))
             self.retranslate_ui()
 
@@ -1071,12 +1220,14 @@ class MainWin(QMainWindow):
         self.global_stats_container.setVisible(checked)
         arrow = "▼" if checked else "▶"
         self.btn_global_stats.setText(f"{arrow} {self.translator.tr('btn_global_stats')}")
+        logger.debug("Global statistics panel visibility set to %s", checked)
 
     def center_paper_tape_trace(self) -> None:
         """Auto-adjust the Paper Tape Y-axis range to center on current trace values."""
         all_y = self._tape_rate_even + self._tape_rate_odd
         if not all_y:
             self.paper_tape_plot.setYRange(-10.0, 12.0)
+            logger.debug("Paper tape trace centered to default range [-10.0, 12.0]")
             return
 
         y_min = float(min(all_y))
@@ -1084,6 +1235,12 @@ class MainWin(QMainWindow):
         y_center = 0.5 * (y_min + y_max)
         half_span = max(3.5, 0.75 * (y_max - y_min) + 2.0)
         self.paper_tape_plot.setYRange(y_center - half_span, y_center + half_span)
+        logger.info(
+            "Paper tape trace centered around %.2f s/d (range [%.2f, %.2f])",
+            y_center,
+            y_center - half_span,
+            y_center + half_span,
+        )
 
     def save_current_position(self) -> None:
         """Save current telemetry linked to the selected position (DU, DD, CU, CD, CL, CR)."""
@@ -1099,6 +1256,13 @@ class MainWin(QMainWindow):
                 confidence=0.97,
             )
         self._saved_positions[pos] = record
+        logger.info(
+            "Saved positional telemetry for '%s': rate=%+.2f s/d, BE=%.2f ms, amp=%.1f deg",
+            pos,
+            record.rate_spd,
+            record.beat_error_ms,
+            record.amplitude_deg,
+        )
         self._refresh_global_stats_table()
 
     def _refresh_global_stats_table(self) -> None:
@@ -1127,8 +1291,443 @@ class MainWin(QMainWindow):
             self.lbl_global_mean_val.setText(f"{mean_rate:+.2f} s/d ({len(rates)}P)")
             self.lbl_global_delta_val.setText(f"{max_delta:.2f} s/d")
         else:
-            self.lbl_global_mean_val.setText("--- s/d")
-            self.lbl_global_delta_val.setText("--- s/d")
+            self.lbl_global_mean_val.setText("")
+            self.lbl_global_delta_val.setText("")
+
+    def save_results_csv(self, file_path: Path | str | None = None) -> Path | None:
+        """Export session telemetry results, statistics, and saved positions to a CSV file."""
+        test_name = self.txt_test_name.text().strip() or "watch_test"
+        if file_path is None:
+            default_name = f"{test_name}_results.csv"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                self.translator.tr("dialog_save_csv"),
+                default_name,
+                "CSV Files (*.csv)",
+            )
+            if not chosen:
+                logger.info("CSV export cancelled by user")
+                return None
+            out_path = Path(chosen)
+        else:
+            out_path = Path(file_path)
+
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_suffix(".csv")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cfg = self.current_watch_config()
+        caliber = self.cmb_caliber.currentText()
+        current_pos = self.cmb_position.currentText()
+
+        headers = [
+            "test_name",
+            "caliber",
+            "bph",
+            "lift_angle",
+            "sample_rate",
+            "position",
+            "record_type",
+            "elapsed_s",
+            "rate_spd",
+            "beat_error_ms",
+            "amplitude_deg",
+            "confidence",
+            "snr_db",
+        ]
+
+        rows_written = 0
+        try:
+            with out_path.open(mode="w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=headers)
+                writer.writeheader()
+
+                for rec in self._session_records:
+                    writer.writerow(rec)
+                    rows_written += 1
+
+                if self._last_telemetry is not None and not self._session_records:
+                    writer.writerow(
+                        {
+                            "test_name": test_name,
+                            "caliber": caliber,
+                            "bph": cfg.bph,
+                            "lift_angle": f"{cfg.lift_angle:.1f}",
+                            "sample_rate": cfg.sample_rate,
+                            "position": current_pos,
+                            "record_type": "sample",
+                            "elapsed_s": "0.00",
+                            "rate_spd": f"{self._last_telemetry.rate_spd:.2f}",
+                            "beat_error_ms": f"{self._last_telemetry.beat_error_ms:.2f}",
+                            "amplitude_deg": f"{self._last_telemetry.amplitude_deg:.1f}",
+                            "confidence": f"{self._last_telemetry.confidence:.3f}",
+                            "snr_db": "",
+                        }
+                    )
+                    rows_written += 1
+
+                for pos, pos_rec in self._saved_positions.items():
+                    writer.writerow(
+                        {
+                            "test_name": test_name,
+                            "caliber": caliber,
+                            "bph": cfg.bph,
+                            "lift_angle": f"{cfg.lift_angle:.1f}",
+                            "sample_rate": cfg.sample_rate,
+                            "position": pos,
+                            "record_type": "saved_position",
+                            "elapsed_s": "",
+                            "rate_spd": f"{pos_rec.rate_spd:.2f}",
+                            "beat_error_ms": f"{pos_rec.beat_error_ms:.2f}",
+                            "amplitude_deg": f"{pos_rec.amplitude_deg:.1f}",
+                            "confidence": f"{pos_rec.confidence:.3f}",
+                            "snr_db": "",
+                        }
+                    )
+                    rows_written += 1
+
+            logger.info("Saved %d telemetry result rows to CSV '%s'", rows_written, out_path)
+            return out_path
+        except Exception as exc:
+            logger.error("Failed to save telemetry CSV to '%s': %s", out_path, exc, exc_info=True)
+            raise
+
+    def export_test_results(self, file_path: Path | str | None = None) -> Path | None:
+        """Export only the global positional statistics and positional delta to a CSV file."""
+        test_name = self.txt_test_name.text().strip() or "watch_test"
+        if file_path is None:
+            default_name = f"{test_name}_global_stats.csv"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                self.translator.tr("dialog_export_test_results"),
+                default_name,
+                "CSV Files (*.csv)",
+            )
+            if not chosen:
+                logger.info("Export Test Results cancelled by user")
+                return None
+            out_path = Path(chosen)
+        else:
+            out_path = Path(file_path)
+
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_suffix(".csv")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cfg = self.current_watch_config()
+        caliber = self.cmb_caliber.currentText()
+        positions_order = [
+            p for p in ("DU", "DD", "CU", "CD", "CL", "CR") if p in self._saved_positions
+        ]
+        rates = [self._saved_positions[p].rate_spd for p in positions_order]
+        mean_rate = float(np.mean(rates)) if rates else 0.0
+        max_delta = float(max(rates) - min(rates)) if len(rates) >= 2 else 0.0
+
+        headers = [
+            "test_name",
+            "caliber",
+            "bph",
+            "lift_angle",
+            "position",
+            "rate_spd",
+            "beat_error_ms",
+            "amplitude_deg",
+            "confidence",
+            "global_mean_spd",
+            "positional_delta_spd",
+        ]
+
+        try:
+            with out_path.open(mode="w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=headers)
+                writer.writeheader()
+                for pos in positions_order:
+                    rec = self._saved_positions[pos]
+                    writer.writerow(
+                        {
+                            "test_name": test_name,
+                            "caliber": caliber,
+                            "bph": cfg.bph,
+                            "lift_angle": f"{cfg.lift_angle:.1f}",
+                            "position": pos,
+                            "rate_spd": f"{rec.rate_spd:.2f}",
+                            "beat_error_ms": f"{rec.beat_error_ms:.2f}",
+                            "amplitude_deg": f"{rec.amplitude_deg:.1f}",
+                            "confidence": f"{rec.confidence:.3f}",
+                            "global_mean_spd": "",
+                            "positional_delta_spd": "",
+                        }
+                    )
+                writer.writerow(
+                    {
+                        "test_name": test_name,
+                        "caliber": caliber,
+                        "bph": cfg.bph,
+                        "lift_angle": f"{cfg.lift_angle:.1f}",
+                        "position": "GLOBAL_SUMMARY",
+                        "rate_spd": "",
+                        "beat_error_ms": "",
+                        "amplitude_deg": "",
+                        "confidence": "",
+                        "global_mean_spd": f"{mean_rate:.2f}" if rates else "",
+                        "positional_delta_spd": f"{max_delta:.2f}" if rates else "",
+                    }
+                )
+            logger.info(
+                "Exported global positional test results (%d positions, delta=%.2f s/d) to '%s'",
+                len(positions_order),
+                max_delta,
+                out_path,
+            )
+            return out_path
+        except Exception as exc:
+            logger.error("Failed to export test results to '%s': %s", out_path, exc, exc_info=True)
+            raise
+
+    def _on_buy_coffee_clicked(self) -> None:
+        """Placeholder handler for the 'Buy me a coffee' button."""
+        logger.info("'Buy me a coffee' placeholder button clicked")
+
+    def _render_traces_image(self) -> QImage:
+        """Render the three acoustic/telemetry trace graphs and metadata banner into a QImage."""
+        self.graphs_splitter.repaint()
+        graphs_pixmap = self.graphs_splitter.grab()
+        gw = max(800, graphs_pixmap.width())
+        gh = max(500, graphs_pixmap.height())
+        banner_h = 64
+
+        image = QImage(gw, gh + banner_h, QImage.Format.Format_ARGB32)
+        image.fill(QColor("#0f1217"))
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QColor("#00e5ff"))
+        painter.setFont(QFont("Inter", 12, QFont.Weight.Bold))
+        test_name = self.txt_test_name.text().strip() or "Caliber-Test"
+        caliber = self.cmb_caliber.currentText()
+        cfg = self.current_watch_config()
+        pos = self.cmb_position.currentText()
+        header_line = (
+            f"{test_name} | {caliber} | {cfg.bph} BPH | "
+            f"Lift {cfg.lift_angle:.1f}° | Pos {pos}"
+        )
+        painter.drawText(16, 26, header_line)
+
+        painter.setPen(QColor("#d8dee9"))
+        painter.setFont(QFont("JetBrains Mono", 10))
+        stats_line = (
+            f"Rate: {self.card_rate.value_label.text()} s/d   "
+            f"Beat Error: {self.card_beat_error.value_label.text()} ms   "
+            f"Amplitude: {self.card_amplitude.value_label.text()}   "
+            f"Mean: {self.lbl_stat_mean_val.text() or 'N/A'}   "
+            f"Delta: {self.lbl_stat_delta_val.text() or 'N/A'}"
+        )
+        painter.drawText(16, 50, stats_line)
+        painter.drawPixmap(0, banner_h, graphs_pixmap)
+        painter.end()
+        return image
+
+    def export_traces(self, file_path: Path | str | None = None) -> Path | None:
+        """Export the audio and telemetry traces to PNG, PDF, or CSV trace data."""
+        test_name = self.txt_test_name.text().strip() or "watch_test"
+        if file_path is None:
+            default_name = f"{test_name}_traces.png"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                self.translator.tr("dialog_export_traces"),
+                default_name,
+                "PNG Image (*.png);;PDF Document (*.pdf);;CSV Trace Data (*.csv)",
+            )
+            if not chosen:
+                logger.info("Trace export cancelled by user")
+                return None
+            out_path = Path(chosen)
+        else:
+            out_path = Path(file_path)
+
+        ext = out_path.suffix.lower()
+        if ext not in (".png", ".pdf", ".csv", ".jpg", ".jpeg"):
+            out_path = out_path.with_suffix(".png")
+            ext = ".png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if ext == ".csv":
+                x_even, y_even = self.tape_curve_even.getData()
+                x_odd, y_odd = self.tape_curve_odd.getData()
+                x_osc, y_osc = self.osc_wave_curve.getData()
+                x_wav, y_wav = self.audio_waveform_curve.getData()
+
+                with out_path.open(mode="w", encoding="utf-8", newline="") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["trace_name", "x", "y"])
+                    if x_even is not None and y_even is not None:
+                        for x_val, y_val in zip(x_even, y_even):
+                            writer.writerow(["paper_tape_even", f"{float(x_val):.6f}", f"{float(y_val):.4f}"])
+                    if x_odd is not None and y_odd is not None:
+                        for x_val, y_val in zip(x_odd, y_odd):
+                            writer.writerow(["paper_tape_odd", f"{float(x_val):.6f}", f"{float(y_val):.4f}"])
+                    if x_osc is not None and y_osc is not None:
+                        for x_val, y_val in zip(x_osc, y_osc):
+                            writer.writerow(["oscilloscope", f"{float(x_val):.6f}", f"{float(y_val):.6f}"])
+                    if x_wav is not None and y_wav is not None:
+                        for x_val, y_val in zip(x_wav, y_wav):
+                            writer.writerow(["audio_waveform", f"{float(x_val):.6f}", f"{float(y_val):.6f}"])
+            elif ext == ".pdf":
+                printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+                printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+                printer.setOutputFileName(str(out_path))
+                printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+                self._paint_traces_to_printer(printer)
+            else:
+                img = self._render_traces_image()
+                if not img.save(str(out_path)):
+                    raise RuntimeError(f"Failed to save trace image to '{out_path}'")
+
+            logger.info("Exported audio traces to '%s'", out_path)
+            return out_path
+        except Exception as exc:
+            logger.error("Failed to export traces to '%s': %s", out_path, exc, exc_info=True)
+            raise
+
+    def _paint_traces_to_printer(self, printer: QPrinter) -> None:
+        """Render the composite trace image onto a QPrinter page."""
+        img = self._render_traces_image()
+        painter = QPainter(printer)
+        try:
+            rect = painter.viewport()
+            scaled = img.scaled(
+                rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x_off = max(0, (rect.width() - scaled.width()) // 2)
+            y_off = max(0, (rect.height() - scaled.height()) // 2)
+            painter.drawImage(QRectF(x_off, y_off, scaled.width(), scaled.height()), scaled)
+        finally:
+            painter.end()
+
+    def print_traces(self, printer: QPrinter | None = None) -> bool:
+        """Print the audio and telemetry traces via QPrintDialog or a provided QPrinter."""
+        try:
+            if printer is None:
+                active_printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+                active_printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+                active_printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+                dialog = QPrintDialog(active_printer, self)
+                if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+                    logger.info("Print traces dialog cancelled by user")
+                    return False
+            else:
+                active_printer = printer
+
+            self._paint_traces_to_printer(active_printer)
+            logger.info("Audio traces printed successfully")
+            return True
+        except Exception as exc:
+            logger.error("Failed to print audio traces: %s", exc, exc_info=True)
+            return False
+
+    def _on_recording_ready(self, audio_buffer: np.ndarray, sample_rate: int) -> None:
+        """Store completed test audio recording from the worker thread."""
+        self._recorded_audio = np.asarray(audio_buffer, dtype=np.float64).copy()
+        self._recorded_sample_rate = int(sample_rate)
+        logger.info(
+            "Test audio recording buffered (%d samples @ %d Hz)",
+            len(self._recorded_audio),
+            self._recorded_sample_rate,
+        )
+
+    def _ensure_test_length_recording(self) -> tuple[np.ndarray, int]:
+        """Return an audio recording matching the exact configured test duration."""
+        cfg = self.current_watch_config()
+        duration_s = float(self.spn_duration.value())
+        expected_samples = int(round(duration_s * cfg.sample_rate))
+
+        if (
+            self._recorded_audio is not None
+            and self._recorded_sample_rate == cfg.sample_rate
+            and len(self._recorded_audio) == expected_samples
+        ):
+            return self._recorded_audio, self._recorded_sample_rate
+
+        pos = self.cmb_position.currentText()
+        base_rate, base_be, base_amp = POSITION_VARIATION.get(pos, (+4.5, 0.35, 280.0))
+        logger.info(
+            "Synthesizing test-length audio recording (duration=%.1f s, samples=%d, fs=%d Hz)",
+            duration_s,
+            expected_samples,
+            cfg.sample_rate,
+        )
+        gen = SyntheticEscapeGenerator(config=cfg, seed=2026)
+        signal = gen.generate(
+            duration_s=duration_s,
+            true_rate_spd=base_rate,
+            true_beat_error_ms=base_be,
+            true_amplitude_deg=base_amp,
+            snr_db=32.0,
+        )
+        if len(signal) > expected_samples:
+            signal = signal[:expected_samples]
+        elif len(signal) < expected_samples:
+            signal = np.pad(signal, (0, expected_samples - len(signal)))
+
+        self._recorded_audio = signal
+        self._recorded_sample_rate = cfg.sample_rate
+        return self._recorded_audio, self._recorded_sample_rate
+
+    def record_audio(
+        self, file_path: Path | str | None = None, prefer_flac: bool = True
+    ) -> Path | None:
+        """Record test-duration audio and offer to save it (default FLAC if supported, else Vorbis)."""
+        if (
+            file_path is None
+            and self.worker is not None
+            and self.worker.isRunning()
+        ):
+            self._save_audio_on_finish = True
+            logger.info(
+                "Audio recording armed for active test session; will prompt to save upon completion"
+            )
+            return None
+
+        return self.save_recorded_audio(file_path=file_path, prefer_flac=prefer_flac)
+
+    def save_recorded_audio(
+        self, file_path: Path | str | None = None, prefer_flac: bool = True
+    ) -> Path | None:
+        """Save the test-length audio recording to disk (FLAC by default if possible, else Ogg Vorbis)."""
+        audio_data, sample_rate = self._ensure_test_length_recording()
+        flac_ok = prefer_flac and is_flac_supported()
+        default_ext = "flac" if flac_ok else "ogg"
+        test_name = self.txt_test_name.text().strip() or "watch_test"
+
+        if file_path is None:
+            default_name = f"{test_name}.{default_ext}"
+            if flac_ok:
+                file_filter = "FLAC Audio (*.flac);;Ogg Vorbis Audio (*.ogg)"
+            else:
+                file_filter = "Ogg Vorbis Audio (*.ogg)"
+
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                self.translator.tr("dialog_save_audio"),
+                default_name,
+                file_filter,
+            )
+            if not chosen:
+                logger.info("Audio recording save dialog cancelled by user")
+                return None
+            target_path = Path(chosen)
+        else:
+            target_path = Path(file_path)
+
+        return save_audio_recording(
+            file_path=target_path,
+            samples=audio_data,
+            sample_rate=sample_rate,
+            prefer_flac=prefer_flac,
+        )
 
     def retranslate_ui(self) -> None:
         """Apply localized strings from `self.translator` to all widgets."""
@@ -1165,6 +1764,9 @@ class MainWin(QMainWindow):
         self.lbl_stat_elapsed_key.setText(f"{tr('stat_elapsed')}:")
 
         self.btn_save_position.setText(tr("btn_save_position"))
+        self.btn_save_csv.setText(tr("btn_save_csv"))
+        self.btn_export_test_results.setText(tr("btn_export_test_results"))
+        self.btn_buy_coffee.setText(tr("btn_buy_coffee"))
         arrow = "▼" if self.btn_global_stats.isChecked() else "▶"
         self.btn_global_stats.setText(f"{arrow} {tr('btn_global_stats')}")
         self.tbl_global_stats.setHorizontalHeaderLabels(
@@ -1173,7 +1775,10 @@ class MainWin(QMainWindow):
         self.lbl_global_mean_key.setText(f"{tr('global_mean')}:")
         self.lbl_global_delta_key.setText(f"{tr('global_max_delta')}:")
 
+        self.btn_export_traces.setText(tr("btn_export_traces"))
+        self.btn_print_traces.setText(tr("btn_print_traces"))
         self.btn_center_trace.setText(tr("btn_center_trace"))
+        self.btn_record.setText(f"● {tr('btn_record_audio').upper()}")
         self.btn_start.setText(tr("btn_start"))
         self.btn_stop.setText(tr("btn_stop"))
 
@@ -1201,11 +1806,20 @@ class MainWin(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
 
+        logger.info("Starting telemetry capture session")
         self._rate_history.clear()
+        self._session_records.clear()
         self._tape_times_even.clear()
         self._tape_rate_even.clear()
         self._tape_times_odd.clear()
         self._tape_rate_odd.clear()
+        self._recorded_audio = None
+
+        self.lbl_stat_max_val.setText("")
+        self.lbl_stat_min_val.setText("")
+        self.lbl_stat_delta_val.setText("")
+        self.lbl_stat_mean_val.setText("")
+        self.lbl_stat_elapsed_val.setText("")
 
         self.tape_curve_even.setData([], [])
         self.tape_curve_odd.setData([], [])
@@ -1232,12 +1846,14 @@ class MainWin(QMainWindow):
             parent=self,
         )
         self.worker.telemetry_updated.connect(self._on_telemetry_updated)
+        self.worker.recording_ready.connect(self._on_recording_ready)
         self.worker.session_finished.connect(self._on_session_finished)
         self.worker.start()
 
     def stop_capture(self) -> None:
         """Stop the running background telemetry worker thread."""
         if self.worker is not None and self.worker.isRunning():
+            logger.info("Stopping active telemetry capture session")
             self.worker.stop()
             self.worker.wait(1500)
         self._on_session_finished()
@@ -1247,6 +1863,10 @@ class MainWin(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._set_top_controls_enabled(True)
+        logger.info("Telemetry capture session finished")
+        if self._save_audio_on_finish:
+            self._save_audio_on_finish = False
+            self.save_recorded_audio()
 
     def _set_top_controls_enabled(self, enabled: bool) -> None:
         """Enable or disable configuration controls during active measurement."""
@@ -1295,6 +1915,24 @@ class MainWin(QMainWindow):
         if elapsed_s >= stab_s:
             t_meas = elapsed_s - stab_s
             self._rate_history.append(telemetry.rate_spd)
+            cfg_now = self.current_watch_config()
+            self._session_records.append(
+                {
+                    "test_name": self.txt_test_name.text().strip() or "watch_test",
+                    "caliber": self.cmb_caliber.currentText(),
+                    "bph": cfg_now.bph,
+                    "lift_angle": f"{cfg_now.lift_angle:.1f}",
+                    "sample_rate": cfg_now.sample_rate,
+                    "position": self.cmb_position.currentText(),
+                    "record_type": "sample",
+                    "elapsed_s": f"{t_meas:.2f}",
+                    "rate_spd": f"{telemetry.rate_spd:.2f}",
+                    "beat_error_ms": f"{telemetry.beat_error_ms:.2f}",
+                    "amplitude_deg": f"{telemetry.amplitude_deg:.1f}",
+                    "confidence": f"{telemetry.confidence:.3f}",
+                    "snr_db": f"{snr_db:.1f}",
+                }
+            )
 
             r_max = max(self._rate_history)
             r_min = min(self._rate_history)
@@ -1388,5 +2026,6 @@ class MainWin(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Ensure background worker thread is cleanly stopped before window closes."""
+        logger.info("MainWin closing; stopping active worker if running")
         self.stop_capture()
         super().closeEvent(event)

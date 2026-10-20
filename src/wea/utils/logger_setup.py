@@ -25,8 +25,13 @@ class LoggerSetup:
         setup_logger(name): Configures the root logger with the specified name.
     """
 
+    BASE_DIR: Path = Path(__file__).resolve().parents[3]
+    LOG_DIR: Path = BASE_DIR / "logs"
+    LOG_FILE: Path = LOG_DIR / "wea.log"
+    _configured: bool = False
+
     @staticmethod
-    def setup_logger(name):
+    def setup_logger(name: str = "wea") -> logging.Logger:
 
         """
         Configure the application's root logger.
@@ -49,32 +54,35 @@ class LoggerSetup:
             None
         """
 
-        # Defines the root directory of tis file
-        BASE_DIR = Path(__file__).resolve().parents[2]
         # Defines log directory and creates it if it doesn't exist
-        LOG_DIR = BASE_DIR / f"{name.capitalize()}logs"
-        LOG_DIR.mkdir(exist_ok=True)
-        # Complete path to the log file
-        LOG_FILE = LOG_DIR / f"{name}.log"
+        LoggerSetup.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%d-%m-%Y %H:%M:%S",
-            handlers=[
-                logging.FileHandler(LOG_FILE, encoding='utf-8'),
-                logging.StreamHandler()
-            ],
-            force=True
+        root_logger = logging.getLogger()
+        has_unified_handler = any(
+            isinstance(h, logging.FileHandler)
+            and Path(getattr(h, "baseFilename", "")).resolve() == LoggerSetup.LOG_FILE.resolve()
+            for h in root_logger.handlers
         )
+
+        if not LoggerSetup._configured or not has_unified_handler:
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format="%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%d-%m-%Y %H:%M:%S",
+                handlers=[
+                    logging.FileHandler(LoggerSetup.LOG_FILE, encoding="utf-8"),
+                    logging.StreamHandler(),
+                ],
+                force=True,
+            )
+            LoggerSetup._configured = True
 
         logger = logging.getLogger(name)
 
-        logging.debug(
-            "Logger '%s' has been set up with DEBUG level and file "
-            "handler '%s.log'",
+        logger.debug(
+            "Logger '%s' initialized and attached to unified log '%s'",
             name,
-            name,
+            LoggerSetup.LOG_FILE.name,
         )
 
         return logger

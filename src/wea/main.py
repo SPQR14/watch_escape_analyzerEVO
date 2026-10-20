@@ -61,7 +61,9 @@ def main(argv: list[str] | None = None) -> int:
     window.show()
     logger.info("Watch Escape Analyzer EVO window displayed successfully")
     
-    return int(app.exec())
+    exit_code = int(app.exec())
+    logger.info("Watch Escape Analyzer EVO exiting with code %d", exit_code)
+    return exit_code
 
 if __name__ == "__main__":
     raise SystemExit(main())
