@@ -1,7 +1,5 @@
-"""User Interface (UI) module placeholder for Watch Escape Analyzer EVO.
+"""User Interface (UI) module for Watch Escape Analyzer EVO."""
 
-Reserved for decoupled PyQt6 views, PyQtGraph real-time timegrapher traces,
-and P1/P2/P3 acoustic oscilloscopes.
-"""
+from wea.ui.main_window import MainWin
 
-__all__: list[str] = []
+__all__ = ["MainWin"]
