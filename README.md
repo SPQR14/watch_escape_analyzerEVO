@@ -71,6 +71,11 @@ pytest
 
 ---
 
+## TODO:
+- math behind scenes.
+- timing drift
+- buy me a coffee
+
 ## License
 
 This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
