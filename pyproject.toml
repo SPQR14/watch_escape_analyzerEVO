@@ -18,6 +18,8 @@ dependencies = [
     "sounddevice>=0.4.6",
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",
+    "PyOpenGL",
+    "PyOpenGL_accelerate",
 ]
 
 [project.optional-dependencies]
