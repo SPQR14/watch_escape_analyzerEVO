@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from wea.utils.logger_setup import LoggerSetup
+
+logger = LoggerSetup.setup_logger(__name__)
+
 
 class Translator:
     """Provides localized strings in English ('en') and Spanish ('es') for horological metrics."""
@@ -38,6 +42,16 @@ class Translator:
             "btn_stop": "STOP",
             "btn_center_trace": "Center Trace",
             "btn_save_position": "Save Position",
+            "btn_save_csv": "Export Results to CSV",
+            "btn_export_test_results": "Export Test Results",
+            "btn_buy_coffee": "☕ Buy me a coffee",
+            "btn_export_traces": "Export Traces",
+            "btn_print_traces": "Print Traces",
+            "btn_record_audio": "Record Audio",
+            "dialog_save_csv": "Export Telemetry Results to CSV",
+            "dialog_export_test_results": "Export Global Statistics & Positional Delta",
+            "dialog_export_traces": "Export Audio Traces",
+            "dialog_save_audio": "Save Recorded Audio",
             "btn_global_stats": "Global Statistics (Positional Delta)",
             "global_stats_summary": "Positional Summary (2–6 Pos)",
             "col_pos": "Pos",
@@ -52,6 +66,9 @@ class Translator:
             "oscilloscope_title": "Real-Time Escapement Oscilloscope (P1 / P2 / P3)",
             "oscilloscope_x": "Time Window (ms)",
             "oscilloscope_y": "Normalized Acoustic Amplitude",
+            "waveform_title": "Real-Time Audio Waveform",
+            "waveform_x": "Time (ms)",
+            "waveform_y": "Acoustic Amplitude",
             "synthetic_device": "Synthetic Ground-Truth Generator",
             "status_idle": "READY",
             "status_stabilizing": "STABILIZING...",
@@ -89,6 +106,16 @@ class Translator:
             "btn_stop": "DETENER",
             "btn_center_trace": "Centrar Trazo",
             "btn_save_position": "Guardar Posición",
+            "btn_save_csv": "Export Results to CSV",
+            "btn_export_test_results": "Export Test Results",
+            "btn_buy_coffee": "☕ Buy me a coffee",
+            "btn_export_traces": "Exportar Trazas",
+            "btn_print_traces": "Imprimir Trazas",
+            "btn_record_audio": "Grabar Sonido",
+            "dialog_save_csv": "Exportar Resultados de Telemetría a CSV",
+            "dialog_export_test_results": "Exportar Estadísticas Globales y Delta Posicional",
+            "dialog_export_traces": "Exportar Trazas de Audio",
+            "dialog_save_audio": "Guardar Grabación de Audio",
             "btn_global_stats": "Estadísticas Globales (Delta Posicional)",
             "global_stats_summary": "Resumen Posicional (2–6 Pos)",
             "col_pos": "Pos",
@@ -103,6 +130,9 @@ class Translator:
             "oscilloscope_title": "Osciloscopio de Escape en Tiempo Real (P1 / P2 / P3)",
             "oscilloscope_x": "Ventana Temporal (ms)",
             "oscilloscope_y": "Amplitud Acústica Normalizada",
+            "waveform_title": "Onda de Audio en Tiempo Real",
+            "waveform_x": "Tiempo (ms)",
+            "waveform_y": "Amplitud Acústica",
             "synthetic_device": "Generador Sintético Ground-Truth",
             "status_idle": "LISTO",
             "status_stabilizing": "ESTABILIZANDO...",
@@ -125,8 +155,10 @@ class Translator:
         """Change the active language code ('en' or 'es')."""
         normalized = locale.strip().lower()
         if normalized not in self.DICTIONARIES:
+            logger.error("Unsupported locale '%s' requested", locale)
             raise ValueError(f"Unsupported locale '{locale}'. Supported: {list(self.DICTIONARIES)}")
         self._locale = normalized
+        logger.info("Translator locale set to '%s'", self._locale)
 
     def tr(self, key: str, default: str | None = None) -> str:
         """Translate a horological key into the current locale."""

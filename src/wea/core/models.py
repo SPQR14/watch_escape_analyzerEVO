@@ -3,22 +3,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from wea.utils.logger_setup import LoggerSetup
 import numpy as np
 
+logger = LoggerSetup.setup_logger(__name__)
 
 @dataclass(slots=True)
 class WatchConfig:
     """Configuration parameters for a mechanical watch movement.
 
     Attributes:
-        bph: Beats per hour (alternations per hour, A/h), e.g., 18000, 21600, 28800, 36000.
+        bph: Beats per hour (alternations per hour, A/h), e.g., 18000, 21600, 28800, 36000. (Default 21600)
         lift_angle: Escapement lift angle in degrees (typically 44.0 to 58.0, standard 52.0).
-        sample_rate: Audio sampling rate in Hz (e.g., 96000 or 192000).
+        sample_rate: Audio sampling rate in Hz (e.g., 96000 or 192000,
+        default set at 48000).
     """
 
-    bph: int = 28800
+    bph: int = 21600
     lift_angle: float = 52.0
-    sample_rate: int = 96000
+    sample_rate: int = 48000
+
+    def __post_init__(self) -> None:
+        if self.bph <= 0:
+            logger.error("Invalid WatchConfig bph=%d (must be positive)", self.bph)
+            raise ValueError("bph must be a positive integer")
+        if self.lift_angle <= 0.0 or self.lift_angle >= 180.0:
+            logger.error("Invalid WatchConfig lift_angle=%.2f", self.lift_angle)
+            raise ValueError("lift_angle must be in (0, 180)")
+        if self.sample_rate <= 0:
+            logger.error("Invalid WatchConfig sample_rate=%d", self.sample_rate)
+            raise ValueError("sample_rate must be a positive integer")
+        logger.info(
+            "WatchConfig initialized with bph=%d, lift_angle=%.1f, sample_rate=%d",
+            self.bph,
+            self.lift_angle,
+            self.sample_rate,
+        )
 
     @property
     def nominal_beat_period(self) -> float:
