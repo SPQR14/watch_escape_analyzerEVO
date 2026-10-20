@@ -13,12 +13,16 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QProgressBar,
     QPushButton,
     QSplitter,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -97,7 +101,6 @@ class SyntheticTelemetryWorker(QThread):
         )
         rng = np.random.default_rng(int(time.time() * 1000) % (2**31 - 1))
 
-        # Pre-generate a slight micro-wander per step so the live HUD and paper tape look realistic
         start_wall = time.monotonic()
         step_interval = 0.25
         step_idx = 0
@@ -107,7 +110,6 @@ class SyntheticTelemetryWorker(QThread):
             if elapsed > self.duration_s + self.stabilization_s:
                 break
 
-            # Slight realistic micro-fluctuation around the ground-truth operating point
             inst_rate = base_rate + float(rng.normal(0.0, 0.08))
             inst_be = max(0.0, base_be + float(rng.normal(0.0, 0.015)))
             inst_amp = base_amp + float(rng.normal(0.0, 0.6))
@@ -130,7 +132,6 @@ class SyntheticTelemetryWorker(QThread):
                 self.telemetry_updated.emit(telemetry, beats, elapsed, snr_db)
 
             step_idx += 1
-            # Sleep in small slices so stop() responds immediately
             sleep_deadline = time.monotonic() + step_interval
             while self._running and time.monotonic() < sleep_deadline:
                 self.msleep(25)
@@ -153,8 +154,8 @@ class HudCard(QFrame):
         self._accent_color = accent_color
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(4)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(2)
 
         header_layout = QHBoxLayout()
         self.title_label = QLabel(title)
@@ -167,7 +168,7 @@ class HudCard(QFrame):
 
         self.value_label = QLabel("---.-")
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        mono_font = QFont("JetBrains Mono", 28, QFont.Weight.Bold)
+        mono_font = QFont("JetBrains Mono", 24, QFont.Weight.Bold)
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
         self.value_label.setFont(mono_font)
         self.value_label.setStyleSheet(f"color: {self._accent_color};")
@@ -187,25 +188,33 @@ class HudCard(QFrame):
 class MainWin(QMainWindow):
     """Primary application window for Watch Escape Analyzer EVO."""
 
+    COSC_MIN_SPD: float = -4.0
+    COSC_MAX_SPD: float = +6.0
+
     def __init__(self, translator: Translator | None = None) -> None:
         super().__init__()
         self.translator = translator if translator is not None else Translator("en")
         self.worker: SyntheticTelemetryWorker | None = None
 
-        # Telemetry history for statistics & paper tape trace
+        # Telemetry history for statistics & horizontal paper tape trace
         self._rate_history: list[float] = []
-        self._tape_times: list[float] = []
-        self._tape_drift_even: list[float] = []
         self._tape_times_even: list[float] = []
-        self._tape_drift_odd: list[float] = []
+        self._tape_rate_even: list[float] = []
         self._tape_times_odd: list[float] = []
-        self._cumulative_drift_ms: float = 0.0
-        self._last_tape_t: float = 0.0
+        self._tape_rate_odd: list[float] = []
+        self._last_telemetry: TelemetryResult | None = None
 
-        self.setMinimumSize(1360, 820)
+        # Saved positional telemetry records (keyed by position: DU, DD, CU, CD, CL, CR)
+        self._saved_positions: dict[str, TelemetryResult] = {
+            "DU": TelemetryResult(rate_spd=+4.4, beat_error_ms=0.35, amplitude_deg=282.0, confidence=0.98),
+            "CU": TelemetryResult(rate_spd=-1.4, beat_error_ms=0.52, amplitude_deg=249.0, confidence=0.96),
+        }
+
+        self.setMinimumSize(1360, 840)
         self._apply_industrial_theme()
         self._build_ui()
         self.retranslate_ui()
+        self._refresh_global_stats_table()
 
     def _apply_industrial_theme(self) -> None:
         """Apply dark industrial test-bench stylesheet."""
@@ -258,10 +267,10 @@ class MainWin(QMainWindow):
             QLabel#StatValue {
                 color: #eceff4;
                 font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 700;
             }
-            QComboBox, QSpinBox, QDoubleSpinBox {
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                 background-color: #0d1117;
                 border: 1px solid #303947;
                 border-radius: 4px;
@@ -269,7 +278,7 @@ class MainWin(QMainWindow):
                 color: #e5e9f0;
                 min-height: 22px;
             }
-            QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
                 border: 1px solid #00e5ff;
             }
             QProgressBar {
@@ -279,7 +288,7 @@ class MainWin(QMainWindow):
                 text-align: center;
                 color: #e5e9f0;
                 font-weight: bold;
-                min-height: 18px;
+                min-height: 16px;
             }
             QProgressBar::chunk {
                 background-color: qlineargradient(
@@ -288,12 +297,39 @@ class MainWin(QMainWindow):
                 );
                 border-radius: 3px;
             }
+            QPushButton#ActionButton, QPushButton#CenterTraceButton {
+                background-color: #1c2430;
+                color: #00e5ff;
+                border: 1px solid #2f3e52;
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton#ActionButton:hover, QPushButton#CenterTraceButton:hover {
+                background-color: #253142;
+                border-color: #00e5ff;
+            }
+            QPushButton#CollapsibleButton {
+                background-color: #151c25;
+                color: #c8d1de;
+                border: 1px solid #2b3545;
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 11px;
+                font-weight: 700;
+                text-align: left;
+            }
+            QPushButton#CollapsibleButton:hover {
+                border-color: #00e5ff;
+                color: #ffffff;
+            }
             QPushButton#StartButton {
                 background-color: #00c853;
                 color: #08120c;
                 border: 1px solid #00e676;
                 border-radius: 5px;
-                padding: 10px 16px;
+                padding: 9px 14px;
                 font-size: 13px;
                 font-weight: 800;
                 letter-spacing: 1px;
@@ -311,7 +347,7 @@ class MainWin(QMainWindow):
                 color: #ffffff;
                 border: 1px solid #ff1744;
                 border-radius: 5px;
-                padding: 10px 16px;
+                padding: 9px 14px;
                 font-size: 13px;
                 font-weight: 800;
                 letter-spacing: 1px;
@@ -323,6 +359,22 @@ class MainWin(QMainWindow):
                 background-color: #381a1e;
                 color: #6e4f53;
                 border-color: #4a2328;
+            }
+            QTableWidget {
+                background-color: #0d1117;
+                border: 1px solid #262f3d;
+                gridline-color: #1f2631;
+                color: #d8dee9;
+                font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+                font-size: 11px;
+            }
+            QHeaderView::section {
+                background-color: #161b22;
+                color: #8b96a8;
+                border: 1px solid #262f3d;
+                padding: 3px 4px;
+                font-size: 10px;
+                font-weight: 700;
             }
             QSplitter::handle {
                 background-color: #1f2631;
@@ -345,7 +397,14 @@ class MainWin(QMainWindow):
         self.top_bar.setObjectName("TopBar")
         top_layout = QHBoxLayout(self.top_bar)
         top_layout.setContentsMargins(12, 8, 12, 8)
-        top_layout.setSpacing(12)
+        top_layout.setSpacing(10)
+
+        # Test Name (QLineEdit)
+        self.lbl_test_name = QLabel()
+        self.lbl_test_name.setObjectName("TopBarLabel")
+        self.txt_test_name = QLineEdit()
+        self.txt_test_name.setMinimumWidth(165)
+        self.txt_test_name.setText("Caliber-Test-01")
 
         # Caliber Preset
         self.lbl_caliber = QLabel()
@@ -420,6 +479,7 @@ class MainWin(QMainWindow):
         self.cmb_lang.currentIndexChanged.connect(self._on_language_changed)
 
         for lbl, widget in (
+            (self.lbl_test_name, self.txt_test_name),
             (self.lbl_caliber, self.cmb_caliber),
             (self.lbl_bph, self.cmb_bph),
             (self.lbl_lift, self.spn_lift),
@@ -449,11 +509,11 @@ class MainWin(QMainWindow):
         # --- Left Column: Control Panel & HUD ---
         self.left_panel = QFrame()
         self.left_panel.setObjectName("ControlPanel")
-        self.left_panel.setMinimumWidth(290)
-        self.left_panel.setMaximumWidth(380)
+        self.left_panel.setMinimumWidth(300)
+        self.left_panel.setMaximumWidth(390)
         left_layout = QVBoxLayout(self.left_panel)
-        left_layout.setContentsMargins(12, 12, 12, 12)
-        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
 
         self.card_rate = HudCard("RATE", "s/d", accent_color="#00e5ff")
         self.card_beat_error = HudCard("BEAT ERROR", "ms", accent_color="#00e676")
@@ -467,8 +527,8 @@ class MainWin(QMainWindow):
         self.snr_panel = QFrame()
         self.snr_panel.setObjectName("SubPanel")
         snr_layout = QVBoxLayout(self.snr_panel)
-        snr_layout.setContentsMargins(10, 8, 10, 8)
-        snr_layout.setSpacing(6)
+        snr_layout.setContentsMargins(10, 6, 10, 6)
+        snr_layout.setSpacing(4)
 
         snr_header = QHBoxLayout()
         self.lbl_signal_quality = QLabel()
@@ -491,16 +551,16 @@ class MainWin(QMainWindow):
         self.stats_panel = QFrame()
         self.stats_panel.setObjectName("SubPanel")
         stats_layout = QVBoxLayout(self.stats_panel)
-        stats_layout.setContentsMargins(10, 8, 10, 8)
-        stats_layout.setSpacing(6)
+        stats_layout.setContentsMargins(10, 6, 10, 6)
+        stats_layout.setSpacing(4)
 
         self.lbl_stats_title = QLabel()
         self.lbl_stats_title.setObjectName("SectionHeader")
         stats_layout.addWidget(self.lbl_stats_title)
 
         stats_grid = QGridLayout()
-        stats_grid.setHorizontalSpacing(10)
-        stats_grid.setVerticalSpacing(5)
+        stats_grid.setHorizontalSpacing(8)
+        stats_grid.setVerticalSpacing(3)
 
         self.lbl_stat_max_key = QLabel()
         self.lbl_stat_max_val = QLabel("--- s/d")
@@ -542,6 +602,57 @@ class MainWin(QMainWindow):
         stats_layout.addLayout(stats_grid)
         left_layout.addWidget(self.stats_panel)
 
+        # Positional Test Management: "Guardar Posición" & Collapsible "Estadísticas Globales (Delta Posicional)"
+        self.btn_save_position = QPushButton()
+        self.btn_save_position.setObjectName("ActionButton")
+        self.btn_save_position.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_position.clicked.connect(self.save_current_position)
+        left_layout.addWidget(self.btn_save_position)
+
+        self.btn_global_stats = QPushButton()
+        self.btn_global_stats.setObjectName("CollapsibleButton")
+        self.btn_global_stats.setCheckable(True)
+        self.btn_global_stats.setChecked(True)
+        self.btn_global_stats.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_global_stats.toggled.connect(self._on_toggle_global_stats)
+        left_layout.addWidget(self.btn_global_stats)
+
+        self.global_stats_container = QFrame()
+        self.global_stats_container.setObjectName("SubPanel")
+        gstats_layout = QVBoxLayout(self.global_stats_container)
+        gstats_layout.setContentsMargins(8, 6, 8, 6)
+        gstats_layout.setSpacing(4)
+
+        self.tbl_global_stats = QTableWidget(0, 4)
+        self.tbl_global_stats.setMinimumHeight(95)
+        self.tbl_global_stats.setMaximumHeight(130)
+        self.tbl_global_stats.verticalHeader().setVisible(False)
+        self.tbl_global_stats.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl_global_stats.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        header = self.tbl_global_stats.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        gstats_layout.addWidget(self.tbl_global_stats)
+
+        summary_grid = QGridLayout()
+        summary_grid.setHorizontalSpacing(8)
+        summary_grid.setVerticalSpacing(2)
+        self.lbl_global_mean_key = QLabel()
+        self.lbl_global_mean_val = QLabel("--- s/d")
+        self.lbl_global_mean_val.setObjectName("StatValue")
+        self.lbl_global_mean_val.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.lbl_global_delta_key = QLabel()
+        self.lbl_global_delta_val = QLabel("--- s/d")
+        self.lbl_global_delta_val.setObjectName("StatValue")
+        self.lbl_global_delta_val.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        summary_grid.addWidget(self.lbl_global_mean_key, 0, 0)
+        summary_grid.addWidget(self.lbl_global_mean_val, 0, 1)
+        summary_grid.addWidget(self.lbl_global_delta_key, 1, 0)
+        summary_grid.addWidget(self.lbl_global_delta_val, 1, 1)
+        gstats_layout.addLayout(summary_grid)
+
+        left_layout.addWidget(self.global_stats_container)
         left_layout.addStretch()
 
         # Start / Stop Buttons
@@ -562,32 +673,52 @@ class MainWin(QMainWindow):
         btn_layout.addWidget(self.btn_stop)
         left_layout.addLayout(btn_layout)
 
-        # --- Center Column: Paper Tape Trace (PlotWidget) ---
+        # --- Center Column: Paper Tape Trace (Horizontal Time on X, Deviation/Rate on Y) ---
         self.center_container = QFrame()
         self.center_container.setObjectName("PlotContainer")
         center_layout = QVBoxLayout(self.center_container)
         center_layout.setContentsMargins(8, 8, 8, 8)
+        center_layout.setSpacing(6)
 
         self.paper_tape_plot = pg.PlotWidget()
         self.paper_tape_plot.showGrid(x=True, y=True, alpha=0.25)
-        self.paper_tape_plot.setXRange(-5.0, 5.0)
-        self.paper_tape_plot.setYRange(0.0, 30.0)
+        self.paper_tape_plot.setXRange(0.0, 30.0)
+        self.paper_tape_plot.setYRange(-10.0, 12.0)
 
-        # Zero-drift reference center line
+        # Zero-deviation horizontal reference line
         self.tape_zero_line = pg.InfiniteLine(
             pos=0.0,
-            angle=90,
+            angle=0,
             pen=pg.mkPen(color="#3b4659", width=1.2, style=Qt.PenStyle.DashLine),
         )
         self.paper_tape_plot.addItem(self.tape_zero_line)
 
-        # Two parallel traces (even/odd beats) simulating a Witschi paper tape
+        # Static horizontal translucent green COSC limit lines (-4 s/d and +6 s/d) on Y-axis
+        cosc_pen = pg.mkPen(color=(0, 230, 118, 135), width=1.8, style=Qt.PenStyle.DashLine)
+        self.cosc_lower_line = pg.InfiniteLine(
+            pos=self.COSC_MIN_SPD,
+            angle=0,
+            pen=cosc_pen,
+            label="COSC -4 s/d",
+            labelOpts={"position": 0.08, "color": (0, 230, 118, 200)},
+        )
+        self.cosc_upper_line = pg.InfiniteLine(
+            pos=self.COSC_MAX_SPD,
+            angle=0,
+            pen=cosc_pen,
+            label="COSC +6 s/d",
+            labelOpts={"position": 0.08, "color": (0, 230, 118, 200)},
+        )
+        self.paper_tape_plot.addItem(self.cosc_lower_line)
+        self.paper_tape_plot.addItem(self.cosc_upper_line)
+
+        # Two parallel traces (even/odd beats) using triangle symbols ('t' and 't1')
         self.tape_curve_even = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#00e5ff", width=1.8),
-            symbol="o",
-            symbolSize=5,
+            pen=pg.mkPen(color="#00e5ff", width=1.5),
+            symbol="t",
+            symbolSize=7,
             symbolBrush="#00e5ff",
             symbolPen=None,
             name="Tick (Even)",
@@ -595,14 +726,25 @@ class MainWin(QMainWindow):
         self.tape_curve_odd = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#ffab00", width=1.8),
-            symbol="o",
-            symbolSize=5,
+            pen=pg.mkPen(color="#ffab00", width=1.5),
+            symbol="t1",
+            symbolSize=7,
             symbolBrush="#ffab00",
             symbolPen=None,
             name="Tock (Odd)",
         )
-        center_layout.addWidget(self.paper_tape_plot)
+        center_layout.addWidget(self.paper_tape_plot, stretch=1)
+
+        # Footer bar right beneath Paper Tape Trace with the "Center Trace" button
+        tape_footer_layout = QHBoxLayout()
+        tape_footer_layout.setContentsMargins(2, 0, 2, 0)
+        tape_footer_layout.addStretch()
+        self.btn_center_trace = QPushButton()
+        self.btn_center_trace.setObjectName("CenterTraceButton")
+        self.btn_center_trace.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_center_trace.clicked.connect(self.center_paper_tape_trace)
+        tape_footer_layout.addWidget(self.btn_center_trace)
+        center_layout.addLayout(tape_footer_layout)
 
         # --- Right Column: Real-Time Oscilloscope (PlotWidget) ---
         self.right_container = QFrame()
@@ -658,7 +800,7 @@ class MainWin(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 1)
-        self.splitter.setSizes([310, 520, 520])
+        self.splitter.setSizes([330, 515, 515])
 
         content_layout.addWidget(self.splitter)
         root_layout.addLayout(content_layout, stretch=1)
@@ -676,7 +818,6 @@ class MainWin(QMainWindow):
                     name = dev.get("name", f"Device {idx}")
                     self.cmb_device.addItem(f"[{idx}] {name}", idx)
         except Exception:
-            # Headless / no PortAudio hardware fallback
             pass
 
     def _on_caliber_changed(self, caliber_name: str) -> None:
@@ -693,11 +834,77 @@ class MainWin(QMainWindow):
             self.translator.set_locale(str(lang_code))
             self.retranslate_ui()
 
+    def _on_toggle_global_stats(self, checked: bool) -> None:
+        """Show or hide the collapsible positional statistics section."""
+        self.global_stats_container.setVisible(checked)
+        arrow = "▼" if checked else "▶"
+        self.btn_global_stats.setText(f"{arrow} {self.translator.tr('btn_global_stats')}")
+
+    def center_paper_tape_trace(self) -> None:
+        """Auto-adjust the Paper Tape Y-axis range to center on current trace values."""
+        all_y = self._tape_rate_even + self._tape_rate_odd
+        if not all_y:
+            self.paper_tape_plot.setYRange(-10.0, 12.0)
+            return
+
+        y_min = float(min(all_y))
+        y_max = float(max(all_y))
+        y_center = 0.5 * (y_min + y_max)
+        half_span = max(3.5, 0.75 * (y_max - y_min) + 2.0)
+        self.paper_tape_plot.setYRange(y_center - half_span, y_center + half_span)
+
+    def save_current_position(self) -> None:
+        """Save current telemetry linked to the selected position (DU, DD, CU, CD, CL, CR)."""
+        pos = self.cmb_position.currentText()
+        if self._last_telemetry is not None:
+            record = self._last_telemetry
+        else:
+            base_rate, base_be, base_amp = POSITION_VARIATION.get(pos, (+2.0, 0.4, 270.0))
+            record = TelemetryResult(
+                rate_spd=base_rate,
+                beat_error_ms=base_be,
+                amplitude_deg=base_amp,
+                confidence=0.97,
+            )
+        self._saved_positions[pos] = record
+        self._refresh_global_stats_table()
+
+    def _refresh_global_stats_table(self) -> None:
+        """Update the positional summary table and compute multi-position mean & max delta."""
+        positions_order = [p for p in ("DU", "DD", "CU", "CD", "CL", "CR") if p in self._saved_positions]
+        self.tbl_global_stats.setRowCount(len(positions_order))
+
+        rates: list[float] = []
+        for row_idx, pos in enumerate(positions_order):
+            rec = self._saved_positions[pos]
+            rates.append(rec.rate_spd)
+            vals = (
+                pos,
+                f"{rec.rate_spd:+.1f}",
+                f"{rec.beat_error_ms:.2f}",
+                f"{rec.amplitude_deg:.0f}°",
+            )
+            for col_idx, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.tbl_global_stats.setItem(row_idx, col_idx, item)
+
+        if rates:
+            mean_rate = float(np.mean(rates))
+            max_delta = float(max(rates) - min(rates)) if len(rates) >= 2 else 0.0
+            self.lbl_global_mean_val.setText(f"{mean_rate:+.2f} s/d ({len(rates)}P)")
+            self.lbl_global_delta_val.setText(f"{max_delta:.2f} s/d")
+        else:
+            self.lbl_global_mean_val.setText("--- s/d")
+            self.lbl_global_delta_val.setText("--- s/d")
+
     def retranslate_ui(self) -> None:
         """Apply localized strings from `self.translator` to all widgets."""
         tr = self.translator.tr
         self.setWindowTitle(tr("app_title"))
 
+        self.lbl_test_name.setText(tr("test_name"))
+        self.txt_test_name.setPlaceholderText(tr("test_name_placeholder"))
         self.lbl_caliber.setText(tr("caliber"))
         self.lbl_bph.setText(tr("bph"))
         self.lbl_lift.setText(tr("lift_angle"))
@@ -724,6 +931,16 @@ class MainWin(QMainWindow):
         self.lbl_stat_mean_key.setText(f"{tr('stat_mean')}:")
         self.lbl_stat_elapsed_key.setText(f"{tr('stat_elapsed')}:")
 
+        self.btn_save_position.setText(tr("btn_save_position"))
+        arrow = "▼" if self.btn_global_stats.isChecked() else "▶"
+        self.btn_global_stats.setText(f"{arrow} {tr('btn_global_stats')}")
+        self.tbl_global_stats.setHorizontalHeaderLabels(
+            [tr("col_pos"), tr("col_rate"), tr("col_be"), tr("col_amp")]
+        )
+        self.lbl_global_mean_key.setText(f"{tr('global_mean')}:")
+        self.lbl_global_delta_key.setText(f"{tr('global_max_delta')}:")
+
+        self.btn_center_trace.setText(tr("btn_center_trace"))
         self.btn_start.setText(tr("btn_start"))
         self.btn_stop.setText(tr("btn_stop"))
 
@@ -748,13 +965,10 @@ class MainWin(QMainWindow):
             return
 
         self._rate_history.clear()
-        self._tape_times.clear()
-        self._tape_drift_even.clear()
         self._tape_times_even.clear()
-        self._tape_drift_odd.clear()
+        self._tape_rate_even.clear()
         self._tape_times_odd.clear()
-        self._cumulative_drift_ms = 0.0
-        self._last_tape_t = 0.0
+        self._tape_rate_odd.clear()
 
         self.tape_curve_even.setData([], [])
         self.tape_curve_odd.setData([], [])
@@ -763,7 +977,7 @@ class MainWin(QMainWindow):
 
         duration_s = float(self.spn_duration.value())
         stab_s = float(self.spn_stab.value())
-        self.paper_tape_plot.setYRange(0.0, max(10.0, duration_s))
+        self.paper_tape_plot.setXRange(0.0, max(10.0, duration_s))
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -799,6 +1013,7 @@ class MainWin(QMainWindow):
     def _set_top_controls_enabled(self, enabled: bool) -> None:
         """Enable or disable configuration controls during active measurement."""
         for widget in (
+            self.txt_test_name,
             self.cmb_caliber,
             self.cmb_bph,
             self.spn_lift,
@@ -817,7 +1032,8 @@ class MainWin(QMainWindow):
         elapsed_s: float,
         snr_db: float,
     ) -> None:
-        """Update HUD cards, statistics, Witschi paper tape, and P1/P2/P3 oscilloscope."""
+        """Update HUD cards, statistics, horizontal Witschi paper tape, and P1/P2/P3 oscilloscope."""
+        self._last_telemetry = telemetry
         stab_s = float(self.spn_stab.value())
 
         # Format elapsed time
@@ -836,7 +1052,7 @@ class MainWin(QMainWindow):
         self.card_beat_error.set_value(f"{telemetry.beat_error_ms:.2f}")
         self.card_amplitude.set_value(f"{telemetry.amplitude_deg:.0f}°")
 
-        # Update Statistics & Paper Tape after stabilization period
+        # Update Statistics & Horizontal Paper Tape after stabilization period
         if elapsed_s >= stab_s:
             t_meas = elapsed_s - stab_s
             self._rate_history.append(telemetry.rate_spd)
@@ -851,20 +1067,16 @@ class MainWin(QMainWindow):
             self.lbl_stat_delta_val.setText(f"{r_delta:.2f} s/d")
             self.lbl_stat_mean_val.setText(f"{r_mean:+.2f} s/d")
 
-            # Integrate rate deviation into cumulative phase drift (ms):
-            # rate_spd (s/d) / 86.4 = ms/s drift rate
-            dt_step = max(0.0, t_meas - self._last_tape_t)
-            self._last_tape_t = t_meas
-            self._cumulative_drift_ms += (telemetry.rate_spd / 86.4) * dt_step
-
-            half_be = 0.5 * telemetry.beat_error_ms
+            # Horizontal Paper Tape: X = Elapsed Time (s), Y = Deviation/Rate (s/d)
+            # Separate even/odd tracks visually by beat error asymmetry
+            half_be_offset = 0.5 * telemetry.beat_error_ms
             self._tape_times_even.append(t_meas)
-            self._tape_drift_even.append(self._cumulative_drift_ms - half_be)
+            self._tape_rate_even.append(telemetry.rate_spd - half_be_offset)
             self._tape_times_odd.append(t_meas)
-            self._tape_drift_odd.append(self._cumulative_drift_ms + half_be)
+            self._tape_rate_odd.append(telemetry.rate_spd + half_be_offset)
 
-            self.tape_curve_even.setData(self._tape_drift_even, self._tape_times_even)
-            self.tape_curve_odd.setData(self._tape_drift_odd, self._tape_times_odd)
+            self.tape_curve_even.setData(self._tape_times_even, self._tape_rate_even)
+            self.tape_curve_odd.setData(self._tape_times_odd, self._tape_rate_odd)
 
         # Update Right Column Oscilloscope with the latest BeatEvent
         if beats:
@@ -876,9 +1088,6 @@ class MainWin(QMainWindow):
                 norm_wave = wave / peak_abs
                 t_ms = (np.arange(len(wave), dtype=np.float64) / fs) * 1000.0
 
-                # Align relative P1, P2, P3 positions within the extracted beat window
-                # In EscapeDSPPipeline, raw_waveform has length ~12 ms centered around the coarse peak.
-                # Re-locate P1, P2, P3 relative to the window start so the markers sit right on the impulses:
                 dt_p2 = (latest_beat.timestamp_p2 - latest_beat.timestamp_p1) * 1000.0
                 dt_p3 = (latest_beat.timestamp_p3 - latest_beat.timestamp_p1) * 1000.0
 
