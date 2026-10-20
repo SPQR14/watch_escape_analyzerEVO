@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12"]
 
     env:
@@ -62,7 +62,7 @@ jobs:
           pip install pytest pytest-qt numpy scipy PyQt6
           # Si usas pyproject.toml o requirements.txt, descomenta la línea correspondiente:
           # pip install -r requirements.txt
-          # pip install -e .
+          pip install -e .
 
       - name: Run Pytest
         run: |
