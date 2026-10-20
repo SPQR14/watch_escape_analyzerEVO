@@ -34,9 +34,15 @@ ui_*.h
 # Audio captures & local models
 *.wav
 *.flac
+*.ogg
 *.raw
 *.npz
 *.onnx
 *.pt
 recordings/
 datasets/
+
+# Logs
+*.log
+logs/
+*logs/

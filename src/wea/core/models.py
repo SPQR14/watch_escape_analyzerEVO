@@ -23,12 +23,22 @@ class WatchConfig:
     lift_angle: float = 52.0
     sample_rate: int = 48000
 
-    logger.info(
-        "WatchConfig initialized with bph=%d, lift_angle=%.1f, sample_rate=%d",
-        bph,
-        lift_angle,
-        sample_rate,
-    )
+    def __post_init__(self) -> None:
+        if self.bph <= 0:
+            logger.error("Invalid WatchConfig bph=%d (must be positive)", self.bph)
+            raise ValueError("bph must be a positive integer")
+        if self.lift_angle <= 0.0 or self.lift_angle >= 180.0:
+            logger.error("Invalid WatchConfig lift_angle=%.2f", self.lift_angle)
+            raise ValueError("lift_angle must be in (0, 180)")
+        if self.sample_rate <= 0:
+            logger.error("Invalid WatchConfig sample_rate=%d", self.sample_rate)
+            raise ValueError("sample_rate must be a positive integer")
+        logger.info(
+            "WatchConfig initialized with bph=%d, lift_angle=%.1f, sample_rate=%d",
+            self.bph,
+            self.lift_angle,
+            self.sample_rate,
+        )
 
     @property
     def nominal_beat_period(self) -> float:

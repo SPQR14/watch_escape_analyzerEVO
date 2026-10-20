@@ -24,6 +24,7 @@ class AudioRingBuffer:
             dtype: NumPy data type of the samples (default: np.float64).
         """
         if capacity <= 0:
+            logger.error("Failed to initialize AudioRingBuffer: invalid capacity=%d", capacity)
             raise ValueError("capacity must be a positive integer")
         self._capacity = int(capacity)
         self._dtype = np.dtype(dtype)
@@ -31,9 +32,11 @@ class AudioRingBuffer:
         self._write_pos = 0
         self._size = 0
         self._lock = threading.Lock()
-        logger.info("AudioRingBuffer\
-                     initialized with capacity=%d,\
-                     dtype=%s", self._capacity, self._dtype)
+        logger.info(
+            "AudioRingBuffer initialized with capacity=%d, dtype=%s",
+            self._capacity,
+            self._dtype,
+        )
 
     @property
     def capacity(self) -> int:
@@ -52,6 +55,7 @@ class AudioRingBuffer:
             self._buffer.fill(0)
             self._write_pos = 0
             self._size = 0
+        logger.debug("AudioRingBuffer cleared (capacity=%d)", self._capacity)
 
     def write(self, data: np.ndarray) -> None:
         """Write a 1D array of samples into the circular buffer, overwriting oldest if full."""
