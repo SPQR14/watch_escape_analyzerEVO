@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -32,7 +31,6 @@ class LoggerSetup:
 
     @staticmethod
     def setup_logger(name: str = "wea") -> logging.Logger:
-
         """
         Configure the application's root logger.
 

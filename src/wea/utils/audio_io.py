@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import wave
+from pathlib import Path
+
 import numpy as np
 
 from wea.utils.logger_setup import LoggerSetup
@@ -195,9 +196,7 @@ def _write_via_libsndfile(
         _SNDFILE_LIB.sf_close(snd)
 
 
-def _write_via_cli(
-    out_path: Path, samples: np.ndarray, sample_rate: int, target_fmt: str
-) -> bool:
+def _write_via_cli(out_path: Path, samples: np.ndarray, sample_rate: int, target_fmt: str) -> bool:
     """Fallback encoder using ``flac``, ``oggenc``, or ``ffmpeg`` CLI tools."""
     pcm16 = np.clip(samples * 32767.0, -32768.0, 32767.0).astype("<i2")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -270,9 +269,7 @@ def save_audio_recording(
         ext = "flac" if (prefer_flac and is_flac_supported()) else "ogg"
         out_path = out_path.with_suffix(f".{ext}")
     elif ext == "flac" and not is_flac_supported():
-        logger.warning(
-            "FLAC encoding unavailable; falling back to Ogg Vorbis for '%s'", out_path
-        )
+        logger.warning("FLAC encoding unavailable; falling back to Ogg Vorbis for '%s'", out_path)
         ext = "ogg"
         out_path = out_path.with_suffix(".ogg")
 

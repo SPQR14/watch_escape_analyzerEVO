@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from wea.utils.logger_setup import LoggerSetup
+
 import numpy as np
 
+from wea.utils.logger_setup import LoggerSetup
+
 logger = LoggerSetup.setup_logger(__name__)
+
 
 @dataclass(slots=True)
 class WatchConfig:

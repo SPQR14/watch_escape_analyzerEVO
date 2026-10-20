@@ -72,9 +72,7 @@ class EscapeDSPPipeline:
             return raw_signal.copy()
         return sosfiltfilt(self._sos, raw_signal)
 
-    def compute_dual_envelopes(
-        self, filtered_signal: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def compute_dual_envelopes(self, filtered_signal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Extract coarse global RMS envelope and fine sub-millisecond
         envelope.
 
@@ -164,9 +162,7 @@ class EscapeDSPPipeline:
                 # Search for the local peak of P1 within ~0.6 ms after onset
                 p1_search_end = min(onset_idx + int(round(0.0006 * fs)), p3_rel_idx)
                 if p1_search_end > onset_idx:
-                    p1_rel_idx = onset_idx + int(
-                        np.argmax(sub_fine[onset_idx : p1_search_end + 1])
-                    )
+                    p1_rel_idx = onset_idx + int(np.argmax(sub_fine[onset_idx : p1_search_end + 1]))
                     p1_exact_rel = self._parabolic_peak_interp(sub_fine, p1_rel_idx)
                 else:
                     p1_rel_idx = onset_idx
@@ -272,8 +268,7 @@ class EscapeDSPPipeline:
             sin_val = float(np.sin(sin_arg))
             if sin_val > 1e-6:
                 amplitude_deg = float(
-                    np.clip(self.config.lift_angle / (2.0 * sin_val), 50.0,
-                            360.0)
+                    np.clip(self.config.lift_angle / (2.0 * sin_val), 50.0, 360.0)
                 )
             else:
                 amplitude_deg = 0.0
