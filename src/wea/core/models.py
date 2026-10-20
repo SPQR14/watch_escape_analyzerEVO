@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 
 from wea.utils.logger_setup import LoggerSetup
 
@@ -87,4 +88,25 @@ class TelemetryResult:
     rate_spd: float
     beat_error_ms: float
     amplitude_deg: float
+    confidence: float
+
+
+@dataclass(slots=True)
+class BeatTelemetry:
+    """Structured horological telemetry and acoustic envelope from DSPEngine.
+
+    Attributes:
+        rate_spd: Rate deviation in seconds per day (s/d).
+        beat_error_ms: Beat error (asymmetry between tick and tock) in milliseconds (ms).
+        amplitude_deg: Balance wheel oscillation amplitude in degrees.
+        beat_times_sec: Detected beat timestamps in seconds.
+        envelope: Smoothed analytic amplitude envelope of the signal.
+        confidence: Detection confidence score in the range [0.0, 1.0].
+    """
+
+    rate_spd: float
+    beat_error_ms: float
+    amplitude_deg: float
+    beat_times_sec: NDArray[np.float64]
+    envelope: NDArray[np.float64]
     confidence: float

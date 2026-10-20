@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import csv
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QSize, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPageLayout, QPageSize, QPainter
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QPageLayout,
+    QPageSize,
+    QPainter,
+    QSurfaceFormat,
+)
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -48,8 +57,48 @@ from wea.utils.watch_db import load_watch_db
 
 logger = LoggerSetup.setup_logger(__name__)
 
-# Configure PyQtGraph global options for crisp anti-aliased industrial plotting
-pg.setConfigOptions(antialias=True, background="#0d1015", foreground="#9aa5b4")
+
+def configure_pyqtgraph_gpu() -> bool:
+    """Configure PyQtGraph OpenGL GPU hardware acceleration when not in offscreen mode.
+
+    Checks ``QT_QPA_PLATFORM == "offscreen"`` for headless/CI environments. When not in
+    offscreen mode, enables GPU hardware acceleration via
+    ``pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=False)``
+    and configures ``QSurfaceFormat``, falling back gracefully to CPU rendering with a
+    warning log if ``PyOpenGL`` is not installed or OpenGL setup fails.
+    """
+    pg.setConfigOptions(background="#0d1015", foreground="#9aa5b4")
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=False)
+        logger.info(
+            "Headless mode detected (QT_QPA_PLATFORM=offscreen); using CPU rendering for PyQtGraph"
+        )
+        return False
+
+    try:
+        import OpenGL.GL  # noqa: F401
+
+        fmt = QSurfaceFormat.defaultFormat()
+        fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
+        fmt.setSamples(0)
+        QSurfaceFormat.setDefaultFormat(fmt)
+
+        pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=False)
+        logger.info(
+            "Enabled PyQtGraph GPU hardware acceleration "
+            "(useOpenGL=True, enableExperimental=True, antialias=False)"
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "PyQtGraph OpenGL GPU acceleration unavailable (%s); falling back to CPU rendering",
+            exc,
+        )
+        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=False)
+        return False
+
+
+configure_pyqtgraph_gpu()
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
@@ -286,6 +335,7 @@ class MainWin(QMainWindow):
     def __init__(self, translator: Translator | None = None) -> None:
         super().__init__()
         logger.info("Initializing MainWin UI")
+        self._gpu_enabled: bool = configure_pyqtgraph_gpu()
         self.translator = translator if translator is not None else Translator("en")
         self.worker: SyntheticTelemetryWorker | None = None
 
@@ -644,6 +694,12 @@ class MainWin(QMainWindow):
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         combo.setMinimumWidth(min_width)
         self._sync_combo_popup_width(combo, min_width)
+
+    @staticmethod
+    def _optimize_high_freq_curve(curve: pg.PlotDataItem) -> None:
+        """Enable view clipping and peak-preserving auto-downsampling on a high-rate curve."""
+        curve.setClipToView(True)
+        curve.setDownsampling(auto=True, method="peak")
 
     @staticmethod
     def _sync_combo_popup_width(combo: QComboBox, min_width: int = 90) -> None:
@@ -1096,7 +1152,21 @@ class MainWin(QMainWindow):
             [],
             [],
             pen=pg.mkPen(color="#00e5ff", width=1.6),
+            clipToView=True,
+            autoDownsample=True,
+            downsampleMethod="peak",
         )
+        self._optimize_high_freq_curve(self.osc_wave_curve)
+
+        self.osc_envelope_curve = self.oscilloscope_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen(color=(255, 171, 0, 180), width=1.2),
+            clipToView=True,
+            autoDownsample=True,
+            downsampleMethod="peak",
+        )
+        self._optimize_high_freq_curve(self.osc_envelope_curve)
 
         # Vertical markers for P1 (Unlock), P2 (Impulse), P3 (Drop)
         self.line_p1 = pg.InfiniteLine(
@@ -1150,7 +1220,11 @@ class MainWin(QMainWindow):
             [],
             [],
             pen=pg.mkPen(color="#00e676", width=1.3),
+            clipToView=True,
+            autoDownsample=True,
+            downsampleMethod="peak",
         )
+        self._optimize_high_freq_curve(self.audio_waveform_curve)
         waveform_layout.addWidget(self.waveform_plot)
 
         self.bottom_graphs_splitter.addWidget(self.right_container)
@@ -1831,6 +1905,7 @@ class MainWin(QMainWindow):
         self.tape_curve_even.setData([], [])
         self.tape_curve_odd.setData([], [])
         self.osc_wave_curve.setData([], [])
+        self.osc_envelope_curve.setData([], [])
         self.osc_impulse_markers.setData([], [])
         self.audio_waveform_curve.setData([], [])
 
@@ -1981,6 +2056,10 @@ class MainWin(QMainWindow):
                 t_p2_ms = np.clip(t_p1_ms + dt_p2, t_p1_ms, t_p3_ms)
 
                 self.osc_wave_curve.setData(t_ms, norm_wave)
+                env_win = max(int(round(0.00015 * fs)), 3)
+                env_kernel = np.ones(env_win, dtype=np.float64) / float(env_win)
+                norm_env = np.convolve(np.abs(norm_wave), env_kernel, mode="same")
+                self.osc_envelope_curve.setData(t_ms, norm_env)
                 self.line_p1.setPos(t_p1_ms)
                 self.line_p2.setPos(t_p2_ms)
                 self.line_p3.setPos(t_p3_ms)
