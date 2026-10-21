@@ -28,6 +28,7 @@ dev = [
     "pytest-cov",
     "pytest-qt",
     "scipy",
+    "pre-commit",
 ]
 
 [project.scripts]
