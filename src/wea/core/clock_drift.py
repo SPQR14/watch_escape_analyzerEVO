@@ -1,7 +1,9 @@
-"""ADC clock drift estimation and quartz reference calibration for horological telemetry."""
+"""ADC clock drift estimation, quartz calibration, and HFT-style atomic NTP disciplining."""
 
 from __future__ import annotations
 
+import socket
+import struct
 import time
 from collections import deque
 
@@ -13,15 +15,164 @@ from wea.utils.logger_setup import LoggerSetup
 logger = LoggerSetup.setup_logger(__name__)
 
 
+class AtomicNTPDiscipline:
+    """HFT-style minimum-delay UDP NTP client for disciplining host monotonic clock skew.
+
+    Queries a Stratum-1/Anycast NTP server with a burst of 48-byte NTPv3 packets,
+    applies a minimum-delay hull filter to reject asymmetric router queue jitter,
+    and estimates the host CPU monotonic oscillator skew (``cpu_skew_ppm``).
+    """
+
+    NTP_EPOCH_OFFSET: float = 2208988800.0
+    NTP_PACKET_SIZE: int = 48
+    NTP_REQUEST_PACKET: bytes = b"\x1b" + 47 * b"\0"
+    TWO_POW_32: float = float(1 << 32)
+    MIN_ANCHOR_SPAN_SEC: float = 15.0
+    MAX_SKEW_PPM: float = 200.0
+    EMA_ALPHA: float = 0.3
+
+    def __init__(
+        self,
+        host: str = "time.cloudflare.com",
+        port: int = 123,
+        timeout_sec: float = 0.4,
+    ) -> None:
+        """Initialize the atomic NTP discipline client.
+
+        Args:
+            host: NTP server hostname or IP address (default ``"time.cloudflare.com"``).
+            port: UDP port for NTP (default 123).
+            timeout_sec: Socket timeout per packet in seconds (default 0.4s).
+        """
+        self.host: str = str(host)
+        self.port: int = int(port)
+        self.timeout_sec: float = float(timeout_sec)
+        self.cpu_skew_ppm: float = 0.0
+        self._anchor: tuple[float, float] | None = None
+
+        logger.info(
+            "AtomicNTPDiscipline initialized (host='%s', port=%d, timeout=%.2fs)",
+            self.host,
+            self.port,
+            self.timeout_sec,
+        )
+
+    def reset(self) -> None:
+        """Reset the NTP anchor and accumulated CPU skew estimate."""
+        self._anchor = None
+        self.cpu_skew_ppm = 0.0
+
+    def sample_burst(self, burst_size: int = 4) -> tuple[float, float] | None:
+        """Send a burst of UDP NTPv3 requests and select the minimum-delay packet.
+
+        Args:
+            burst_size: Number of back-to-back NTP packets in the burst (default 4).
+
+        Returns:
+            Tuple ``(local_monotonic_midpoint, atomic_server_midpoint)`` in seconds
+            for the single packet with the lowest positive round-trip delay ``delta``,
+            or ``None`` if offline or all packets fail.
+        """
+        count = max(1, int(burst_size))
+        best_delay: float = float("inf")
+        best_sample: tuple[float, float] | None = None
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(self.timeout_sec)
+                for _ in range(count):
+                    try:
+                        t1 = time.perf_counter_ns() * 1e-9
+                        sock.sendto(self.NTP_REQUEST_PACKET, (self.host, self.port))
+                        raw_data, _ = sock.recvfrom(1024)
+                        t4 = time.perf_counter_ns() * 1e-9
+                    except OSError:
+                        continue
+
+                    if len(raw_data) < self.NTP_PACKET_SIZE:
+                        continue
+
+                    t2_sec, t2_frac, t3_sec, t3_frac = struct.unpack("!4I", raw_data[32:48])
+                    t2 = (float(t2_sec) - self.NTP_EPOCH_OFFSET) + (
+                        float(t2_frac) / self.TWO_POW_32
+                    )
+                    t3 = (float(t3_sec) - self.NTP_EPOCH_OFFSET) + (
+                        float(t3_frac) / self.TWO_POW_32
+                    )
+
+                    delta = (t4 - t1) - (t3 - t2)
+                    if 0.0 < delta < best_delay:
+                        best_delay = delta
+                        local_mid = 0.5 * (t1 + t4)
+                        atomic_mid = 0.5 * (t2 + t3)
+                        best_sample = (local_mid, atomic_mid)
+        except OSError as exc:
+            logger.debug("AtomicNTPDiscipline burst failed (offline or unreachable): %s", exc)
+            return None
+
+        return best_sample
+
+    def update_cpu_skew(self, burst_size: int = 4) -> float:
+        """Update the EMA-smoothed host CPU monotonic clock skew in ppm.
+
+        Stores the first valid burst midpoint pair as ``self._anchor``. On subsequent
+        calls where ``dt_local >= 15.0`` seconds, computes ``raw_skew_ppm``, applies
+        a ±200 ppm sanity guardrail, and updates ``self.cpu_skew_ppm`` via EMA
+        (``0.3 * raw + 0.7 * prev``).
+
+        Args:
+            burst_size: Number of UDP NTP packets per burst (default 4).
+
+        Returns:
+            Updated ``self.cpu_skew_ppm`` in parts per million.
+        """
+        sample = self.sample_burst(burst_size=burst_size)
+        if sample is None:
+            return self.cpu_skew_ppm
+
+        t_local, t_atomic = sample
+        if self._anchor is None:
+            self._anchor = (t_local, t_atomic)
+            logger.debug(
+                "AtomicNTPDiscipline anchor established (t_local=%.6f, t_atomic=%.6f)",
+                t_local,
+                t_atomic,
+            )
+            return self.cpu_skew_ppm
+
+        anchor_local, anchor_atomic = self._anchor
+        dt_local = t_local - anchor_local
+        dt_atomic = t_atomic - anchor_atomic
+
+        if dt_local >= self.MIN_ANCHOR_SPAN_SEC and dt_atomic > 0.0:
+            raw_skew_ppm = ((dt_local - dt_atomic) / dt_atomic) * 1e6
+            if abs(raw_skew_ppm) < self.MAX_SKEW_PPM:
+                self.cpu_skew_ppm = float(
+                    self.EMA_ALPHA * raw_skew_ppm + (1.0 - self.EMA_ALPHA) * self.cpu_skew_ppm
+                )
+                logger.info(
+                    "AtomicNTPDiscipline updated cpu_skew_ppm=%+.3f ppm (raw=%+.3f ppm, dt=%.1fs)",
+                    self.cpu_skew_ppm,
+                    raw_skew_ppm,
+                    dt_local,
+                )
+            else:
+                logger.warning(
+                    "Rejected anomalous NTP CPU skew %+.2f ppm (exceeds ±%.1f ppm guardrail)",
+                    raw_skew_ppm,
+                    self.MAX_SKEW_PPM,
+                )
+
+        return self.cpu_skew_ppm
+
+
 class SampleRateDriftEstimator:
     """Estimates and compensates ADC sample clock crystal drift.
 
     Tracks incoming audio buffer chunks against high-resolution monotonic time
-    (``time.perf_counter_ns()``) over a sliding window and performs centered
-    Ordinary Least Squares (OLS) linear regression to recover the effective
-    sampling rate within sub-ppm precision (< 1.15 ppm for ±0.1 s/d rate accuracy).
-    Also supports static calibration from a 1 Hz Lavet stepping motor (3,600 BPH)
-    or high-frequency quartz reference watch.
+    (``time.perf_counter_ns()``) over a sliding window, evaluates decimated centered
+    Ordinary Least Squares (OLS) linear regression smoothed by a first-order EMA,
+    and combines dynamic ADC drift, static quartz calibration, and atomic NTP CPU skew.
     """
 
     SECONDS_PER_DAY: float = 86400.0
@@ -29,6 +180,8 @@ class SampleRateDriftEstimator:
     DEFAULT_MIN_DURATION_SEC: float = 5.0
     DEFAULT_MIN_CHUNKS: int = 10
     DEFAULT_MAX_DRIFT_PPM: float = 500.0
+    DEFAULT_RECALC_INTERVAL_SEC: float = 0.5
+    DEFAULT_EMA_ALPHA: float = 0.15
 
     def __init__(
         self,
@@ -38,6 +191,9 @@ class SampleRateDriftEstimator:
         min_chunks: int = DEFAULT_MIN_CHUNKS,
         max_drift_ppm: float = DEFAULT_MAX_DRIFT_PPM,
         calibration_ppm: float = 0.0,
+        recalc_interval_sec: float = DEFAULT_RECALC_INTERVAL_SEC,
+        ema_alpha: float = DEFAULT_EMA_ALPHA,
+        cpu_skew_ppm: float = 0.0,
     ) -> None:
         """Initialize the sample rate drift estimator.
 
@@ -48,6 +204,9 @@ class SampleRateDriftEstimator:
             min_chunks: Minimum number of audio chunks before activating dynamic OLS (default 10).
             max_drift_ppm: Sanity guardrail threshold in parts per million (default ±500.0 ppm).
             calibration_ppm: Static quartz calibration offset in parts per million.
+            recalc_interval_sec: Minimum elapsed interval between OLS recalculations (default 0.5s).
+            ema_alpha: First-order EMA smoothing factor for OLS slope updates, clamped to [0.01, 1.0].
+            cpu_skew_ppm: Host CPU monotonic clock skew in ppm measured via AtomicNTPDiscipline.
         """
         if nominal_fs <= 0.0:
             logger.error("Invalid nominal_fs=%.2f (must be positive)", nominal_fs)
@@ -61,6 +220,8 @@ class SampleRateDriftEstimator:
             raise ValueError("min_chunks must be at least 2")
         if max_drift_ppm <= 0.0:
             raise ValueError("max_drift_ppm must be positive")
+        if recalc_interval_sec < 0.0:
+            raise ValueError("recalc_interval_sec must be non-negative")
 
         self.nominal_fs: float = float(nominal_fs)
         self.window_sec: float = float(window_sec)
@@ -68,44 +229,71 @@ class SampleRateDriftEstimator:
         self.min_chunks: int = int(min_chunks)
         self.max_drift_ppm: float = float(max_drift_ppm)
         self.calibration_ppm: float = float(calibration_ppm)
+        self.recalc_interval_sec: float = float(recalc_interval_sec)
+        self.ema_alpha: float = float(np.clip(ema_alpha, 0.01, 1.0))
+        self.cpu_skew_ppm: float = float(cpu_skew_ppm)
 
-        self._window: deque[tuple[float, float]] = deque()
+        self._history: deque[tuple[float, float]] = deque()
+        self._window: deque[tuple[float, float]] = self._history
         self._origin_ns: int | None = None
         self._last_elapsed_sec: float | None = None
+        self._last_recalc_sec: float = -float("inf")
         self._cumulative_samples: float = 0.0
         self._chunk_count: int = 0
+        self._ols_eval_count: int = 0
+        self._dynamic_fs: float = float(self.nominal_fs)
         self._dynamic_drift_ppm: float = 0.0
+        self._is_converged: bool = False
 
         logger.info(
             "SampleRateDriftEstimator initialized (nominal_fs=%.1f Hz, window=%.1fs, "
-            "min_duration=%.1fs, min_chunks=%d, max_drift_ppm=%.1f, calibration_ppm=%+.3f)",
+            "min_duration=%.1fs, min_chunks=%d, max_drift_ppm=%.1f, calibration_ppm=%+.3f, "
+            "recalc_interval=%.2fs, ema_alpha=%.2f, cpu_skew_ppm=%+.3f)",
             self.nominal_fs,
             self.window_sec,
             self.min_duration_sec,
             self.min_chunks,
             self.max_drift_ppm,
             self.calibration_ppm,
+            self.recalc_interval_sec,
+            self.ema_alpha,
+            self.cpu_skew_ppm,
         )
 
     def reset(self) -> None:
-        """Clear the dynamic sliding window and reset cumulative sample tracking."""
-        self._window.clear()
+        """Clear the dynamic sliding window and reset cumulative sample and EMA state."""
+        self._history.clear()
         self._origin_ns = None
         self._last_elapsed_sec = None
+        self._last_recalc_sec = -float("inf")
         self._cumulative_samples = 0.0
         self._chunk_count = 0
+        self._ols_eval_count = 0
+        self._dynamic_fs = float(self.nominal_fs)
         self._dynamic_drift_ppm = 0.0
+        self._is_converged = False
         logger.debug("SampleRateDriftEstimator dynamic tracking state reset")
 
     @property
-    def drift_ppm(self) -> float:
-        """Return total clock drift in parts per million (static calibration + dynamic OLS)."""
-        return float(self.calibration_ppm + self._dynamic_drift_ppm)
+    def is_converged(self) -> bool:
+        """Return True once the dynamic OLS estimator has converged at least once."""
+        return self._is_converged
+
+    @property
+    def dynamic_fs(self) -> float:
+        """Return the EMA-smoothed dynamic sample rate estimate in Hz."""
+        return self._dynamic_fs if self._is_converged else self.nominal_fs
 
     @property
     def effective_fs(self) -> float:
-        """Return the effective sample rate in Hz combining static and dynamic drift."""
-        return float(self.nominal_fs * (1.0 + self.drift_ppm * 1e-6))
+        """Return the effective sample rate in Hz combining dynamic OLS, quartz cal, and NTP skew."""
+        base_fs = self._dynamic_fs if self._is_converged else self.nominal_fs
+        return float(base_fs * (1.0 + (self.calibration_ppm - self.cpu_skew_ppm) * 1e-6))
+
+    @property
+    def drift_ppm(self) -> float:
+        """Return total net clock drift in parts per million relative to ``nominal_fs``."""
+        return float(((self.effective_fs - self.nominal_fs) / self.nominal_fs) * 1e6)
 
     @property
     def rate_bias_spd(self) -> float:
@@ -119,7 +307,7 @@ class SampleRateDriftEstimator:
         timestamp_ns: int | None = None,
         elapsed_sec: float | None = None,
     ) -> float:
-        """Record a new audio chunk and update the sliding-window OLS drift estimate.
+        """Record a new audio chunk and update the decimated EMA-smoothed OLS drift estimate.
 
         Args:
             chunk_samples: Number of samples in the newly arrived audio buffer chunk.
@@ -143,9 +331,10 @@ class SampleRateDriftEstimator:
                 self._origin_ns = now_ns
             t_sec = (now_ns - self._origin_ns) * 1e-9
 
-        if len(self._window) == 0:
+        if len(self._history) == 0:
+            self._dynamic_fs = float(self.nominal_fs)
             if t_sec == 0.0:
-                self._window.append((0.0, n_samp))
+                self._history.append((0.0, n_samp))
                 self._last_elapsed_sec = 0.0
                 self._cumulative_samples = n_samp
                 self._chunk_count = 1
@@ -153,8 +342,8 @@ class SampleRateDriftEstimator:
                 inst_fs = n_samp / t_sec
                 inst_ppm = ((inst_fs - self.nominal_fs) / self.nominal_fs) * 1e6
                 if abs(inst_ppm) <= self.max_drift_ppm:
-                    self._window.append((0.0, 0.0))
-                    self._window.append((t_sec, n_samp))
+                    self._history.append((0.0, 0.0))
+                    self._history.append((t_sec, n_samp))
                     self._last_elapsed_sec = t_sec
                     self._cumulative_samples = n_samp
                     self._chunk_count = 1
@@ -164,7 +353,7 @@ class SampleRateDriftEstimator:
                         inst_ppm,
                         self.max_drift_ppm,
                     )
-                    self._window.append((0.0, 0.0))
+                    self._history.append((0.0, 0.0))
                     self._last_elapsed_sec = t_sec
             return self.effective_fs
 
@@ -185,25 +374,38 @@ class SampleRateDriftEstimator:
             self._last_elapsed_sec = t_sec
             return self.effective_fs
 
-        valid_elapsed = self._window[-1][0] + dt
+        valid_elapsed = self._history[-1][0] + dt
         self._cumulative_samples += n_samp
         self._last_elapsed_sec = t_sec
         self._chunk_count += 1
-        self._window.append((valid_elapsed, self._cumulative_samples))
+        self._history.append((valid_elapsed, self._cumulative_samples))
 
-        while len(self._window) > 2 and (valid_elapsed - self._window[0][0]) > self.window_sec:
-            self._window.popleft()
+        cutoff_elapsed = valid_elapsed - self.window_sec
+        while len(self._history) > 2 and self._history[0][0] < cutoff_elapsed:
+            self._history.popleft()
 
-        span_sec = self._window[-1][0] - self._window[0][0]
+        span_sec = self._history[-1][0] - self._history[0][0]
         if (
             self._chunk_count >= self.min_chunks
             and span_sec >= self.min_duration_sec - 1e-9
-            and len(self._window) >= 2
+            and len(self._history) >= 2
+            and (valid_elapsed - self._last_recalc_sec) >= self.recalc_interval_sec - 1e-9
         ):
-            ols_fs = self._compute_centered_ols_fs()
-            ols_ppm = ((ols_fs - self.nominal_fs) / self.nominal_fs) * 1e6
+            self._last_recalc_sec = valid_elapsed
+            self._ols_eval_count += 1
+            raw_slope = self._compute_centered_ols_fs()
+            ols_ppm = ((raw_slope - self.nominal_fs) / self.nominal_fs) * 1e6
             if abs(ols_ppm) <= self.max_drift_ppm:
-                self._dynamic_drift_ppm = float(ols_ppm)
+                if not self._is_converged:
+                    self._dynamic_fs = float(raw_slope)
+                    self._is_converged = True
+                else:
+                    self._dynamic_fs = float(
+                        self.ema_alpha * raw_slope + (1.0 - self.ema_alpha) * self._dynamic_fs
+                    )
+                self._dynamic_drift_ppm = float(
+                    ((self._dynamic_fs - self.nominal_fs) / self.nominal_fs) * 1e6
+                )
             else:
                 logger.warning(
                     "Rejected OLS regression drift %+.2f ppm exceeding ±%.1f ppm guardrail",
@@ -217,8 +419,15 @@ class SampleRateDriftEstimator:
     record_chunk = update
 
     def _compute_centered_ols_fs(self) -> float:
-        """Compute the centered Ordinary Least Squares slope of samples vs monotonic time."""
-        data = np.asarray(self._window, dtype=np.float64)
+        """Compute centered OLS slope of samples vs time using zero-overhead buffer unpacking."""
+        n_pairs = len(self._history)
+        if n_pairs < 2:
+            return self.nominal_fs
+        data = np.fromiter(
+            (val for pair in self._history for val in pair),
+            dtype=np.float64,
+            count=n_pairs * 2,
+        ).reshape(-1, 2)
         t = data[:, 0]
         y = data[:, 1]
         t_centered = t - np.mean(t)
@@ -254,6 +463,8 @@ class SampleRateDriftEstimator:
         if ref_fs <= 0.0:
             raise ValueError("nominal_fs must be positive")
         self.nominal_fs = ref_fs
+        if not self._is_converged:
+            self._dynamic_fs = ref_fs
 
         intervals = np.asarray(measured_samples_per_tick, dtype=np.float64).ravel()
         if len(intervals) == 0:

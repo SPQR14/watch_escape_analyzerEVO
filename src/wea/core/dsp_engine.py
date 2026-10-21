@@ -414,6 +414,11 @@ class DSPEngine:
                 beat_times_sec=np.empty(0, dtype=np.float64),
                 envelope=macro_env,
                 confidence=0.0,
+                snr_db=0.0,
+                beats=beats,
+                micro_envelope=micro_env,
+                filtered_signal=filtered,
+                effective_fs=fs_eff,
             )
 
         p1_times = np.array([b.timestamp_p1 for b in beats], dtype=np.float64)
@@ -457,10 +462,25 @@ class DSPEngine:
             bph=active_bph,
         )
 
-        even_std = float(np.std(even_intervals)) if len(even_intervals) > 1 else 0.0
-        odd_std = float(np.std(odd_intervals)) if len(odd_intervals) > 1 else 0.0
-        jitter = 0.5 * (even_std + odd_std)
+        even_jitter = (
+            1.4826 * float(np.median(np.abs(even_intervals - np.median(even_intervals))))
+            if len(even_intervals) > 1
+            else 0.0
+        )
+        odd_jitter = (
+            1.4826 * float(np.median(np.abs(odd_intervals - np.median(odd_intervals))))
+            if len(odd_intervals) > 1
+            else 0.0
+        )
+        jitter = 0.5 * (even_jitter + odd_jitter)
         confidence = float(np.clip(np.exp(-jitter / 0.0005), 0.0, 1.0))
+
+        # Acoustic SNR (dB): ratio of peak beat envelope amplitude to median noise floor
+        peak_env = float(np.median([np.sqrt(max(b.peak_energy, 0.0)) for b in beats]))
+        noise_floor = float(np.median(macro_env)) + 1e-12
+        snr_db = float(
+            np.clip(20.0 * np.log10(max(peak_env, noise_floor) / noise_floor), 0.0, 60.0)
+        )
 
         telemetry = BeatTelemetry(
             rate_spd=float(rate_spd),
@@ -469,12 +489,19 @@ class DSPEngine:
             beat_times_sec=beat_times,
             envelope=macro_env,
             confidence=confidence,
+            snr_db=snr_db,
+            beats=beats,
+            micro_envelope=micro_env,
+            filtered_signal=filtered,
+            effective_fs=fs_eff,
         )
         logger.debug(
-            "DSPEngine telemetry: rate=%+.3f s/d, BE=%.4f ms, amp=%.2f deg, conf=%.3f (%d beats)",
+            "DSPEngine telemetry: rate=%+.3f s/d, BE=%.4f ms, amp=%.2f deg, "
+            "snr=%.1f dB, conf=%.3f (%d beats)",
             telemetry.rate_spd,
             telemetry.beat_error_ms,
             telemetry.amplitude_deg,
+            telemetry.snr_db,
             telemetry.confidence,
             len(beats),
         )

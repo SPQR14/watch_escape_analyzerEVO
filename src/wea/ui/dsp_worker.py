@@ -1,0 +1,530 @@
+"""Non-blocking real-time Qt DSP worker bridging AudioRingBuffer, SampleRateDriftEstimator, and DSPEngine."""
+
+from __future__ import annotations
+
+import numpy as np
+from numpy.typing import NDArray
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+
+from wea.core.clock_drift import SampleRateDriftEstimator
+from wea.core.dsp_engine import DSPEngine
+from wea.core.models import BeatTelemetry, WatchConfig
+from wea.core.ring_buffer import AudioRingBuffer
+from wea.core.synthetic import SyntheticEscapeGenerator
+from wea.utils.logger_setup import LoggerSetup
+
+logger = LoggerSetup.setup_logger(__name__)
+
+
+class DSPStreamWorker(QObject):
+    """Real-time DSP stream worker designed to run inside a dedicated QThread via moveToThread.
+
+    Coordinates:
+        - ``AudioRingBuffer`` for pre-allocated circular sample storage.
+        - ``SampleRateDriftEstimator`` for dynamic OLS and static quartz clock drift compensation.
+        - ``DSPEngine`` for multi-threaded Hilbert envelope and escapement telemetry extraction.
+        - ``SyntheticEscapeGenerator`` for phase-continuous real-time synthetic simulation when
+          hardware capture is not active.
+    """
+
+    telemetry_ready = pyqtSignal(object)
+    waveform_ready = pyqtSignal(object, object)
+    drift_updated = pyqtSignal(float, float, float)
+    error_occurred = pyqtSignal(str)
+    session_finished = pyqtSignal()
+
+    _sig_start_timer = pyqtSignal(int)
+    _sig_stop_timer = pyqtSignal()
+
+    DEFAULT_BUFFER_DURATION_S: float = 8.0
+    DEFAULT_WINDOW_DURATION_S: float = 4.0
+    DEFAULT_CHUNK_SIZE: int = 4096
+    WAVEFORM_WINDOW_MS: float = 600.0
+
+    def __init__(
+        self,
+        config: WatchConfig | None = None,
+        *,
+        buffer_duration_s: float = DEFAULT_BUFFER_DURATION_S,
+        window_duration_s: float = DEFAULT_WINDOW_DURATION_S,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        calibration_ppm: float = 0.0,
+        synthetic_mode: bool = True,
+        synthetic_rate_spd: float = 4.5,
+        synthetic_beat_error_ms: float = 0.35,
+        synthetic_amplitude_deg: float = 280.0,
+        synthetic_snr_db: float = 35.0,
+        workers: int | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        """Initialize the real-time DSP worker and its underlying mathematical components.
+
+        Args:
+            config: Watch movement configuration (BPH, lift angle, sample rate).
+            buffer_duration_s: Ring buffer capacity in seconds (default 8.0s).
+            window_duration_s: Sliding DSP analysis window in seconds (default 4.0s).
+            chunk_size: Number of audio samples per streaming chunk (default 4096).
+            calibration_ppm: Initial static clock drift calibration offset in ppm.
+            synthetic_mode: Whether ``start_stream()`` feeds synthetic chunks on a timer.
+            synthetic_rate_spd: Ground-truth rate (s/d) used in synthetic simulation mode.
+            synthetic_beat_error_ms: Ground-truth beat error (ms) used in synthetic mode.
+            synthetic_amplitude_deg: Ground-truth amplitude (deg) used in synthetic mode.
+            synthetic_snr_db: SNR (dB) used in synthetic simulation mode.
+            workers: Number of worker threads inside ``DSPEngine``.
+            parent: Optional Qt parent object.
+        """
+        super().__init__(parent)
+
+        self.config: WatchConfig = config if config is not None else WatchConfig()
+        self.buffer_duration_s: float = max(2.0, float(buffer_duration_s))
+        self.window_duration_s: float = max(
+            1.0, min(float(window_duration_s), self.buffer_duration_s)
+        )
+        self.chunk_size: int = max(256, int(chunk_size))
+        self.synthetic_mode: bool = bool(synthetic_mode)
+
+        self.synthetic_rate_spd: float = float(synthetic_rate_spd)
+        self.synthetic_beat_error_ms: float = float(synthetic_beat_error_ms)
+        self.synthetic_amplitude_deg: float = float(synthetic_amplitude_deg)
+        self.synthetic_snr_db: float = float(synthetic_snr_db)
+
+        capacity_samples = int(round(self.buffer_duration_s * self.config.sample_rate))
+        self.ring_buffer = AudioRingBuffer(capacity_samples=capacity_samples)
+        self.drift_estimator = SampleRateDriftEstimator(
+            nominal_fs=float(self.config.sample_rate),
+            calibration_ppm=float(calibration_ppm),
+        )
+        self.dsp_engine = DSPEngine(
+            config=self.config,
+            workers=workers,
+            drift_estimator=self.drift_estimator,
+        )
+
+        self._window_samples: int = 0
+        self._min_analysis_samples: int = 0
+        self._analysis_hop_samples: int = 0
+        self._samples_since_last_analysis: int = 0
+        self._has_emitted_telemetry: bool = False
+        self._recompute_window_thresholds()
+
+        self._running: bool = False
+        self._receiving_external_chunks: bool = False
+        self._synth_seed: int = 1000
+        self._synth_buffer: NDArray[np.float64] = np.empty(0, dtype=np.float64)
+        self._synth_cursor: int = 0
+        self._synth_next_p1_s: float = 0.050
+        self._synth_beat_idx: int = 0
+        self._waveform_step_idx: int = 0
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._on_synthetic_timer_tick)
+        self._sig_start_timer.connect(self._timer.start)
+        self._sig_stop_timer.connect(self._timer.stop)
+
+        logger.info(
+            "DSPStreamWorker initialized (bph=%d, lift=%.1f deg, fs=%d Hz, "
+            "capacity=%d samples, chunk_size=%d, synthetic_mode=%s)",
+            self.config.bph,
+            self.config.lift_angle,
+            self.config.sample_rate,
+            self.ring_buffer.capacity_samples,
+            self.chunk_size,
+            self.synthetic_mode,
+        )
+
+    @property
+    def engine(self) -> DSPEngine:
+        """Return the underlying DSPEngine instance."""
+        return self.dsp_engine
+
+    def isRunning(self) -> bool:  # noqa: N802
+        """Return True if the stream worker is currently active."""
+        return self._running
+
+    def _recompute_window_thresholds(self) -> None:
+        """Compute sample thresholds for sliding-window DSP execution."""
+        fs = self.config.sample_rate
+        self._window_samples = min(
+            self.ring_buffer.capacity_samples,
+            int(round(self.window_duration_s * fs)),
+        )
+        min_beats_sec = max(1.0, 5.0 * self.config.nominal_beat_period)
+        self._min_analysis_samples = min(
+            self._window_samples,
+            int(round(min_beats_sec * fs)),
+        )
+        self._analysis_hop_samples = max(self.chunk_size, int(round(0.25 * fs)))
+
+    def _timer_interval_ms(self) -> int:
+        """Compute realistic timer interval in milliseconds for ``chunk_size`` at ``sample_rate``."""
+        return max(15, int(round((self.chunk_size / float(self.config.sample_rate)) * 1000.0)))
+
+    def _reset_synthetic_state(self) -> None:
+        """Reset phase-continuous synthetic generator state."""
+        self._synth_buffer = np.empty(0, dtype=np.float64)
+        self._synth_cursor = 0
+        self._synth_next_p1_s = 0.050
+        self._synth_beat_idx = 0
+        self._waveform_step_idx = 0
+
+    def _generate_phase_continuous_block(self, min_duration_s: float = 6.0) -> NDArray[np.float64]:
+        """Synthesize a phase-continuous escapement audio block preserving exact beat timing."""
+        fs = self.config.sample_rate
+        gen = SyntheticEscapeGenerator(config=self.config, seed=self._synth_seed)
+        self._synth_seed += 1
+
+        t0 = self.config.nominal_beat_period
+        rate_factor = 1.0 + (self.synthetic_rate_spd / SyntheticEscapeGenerator.SECONDS_PER_DAY)
+        mean_beat_period = t0 / rate_factor
+        half_be_s = 0.5 * (self.synthetic_beat_error_ms * 1e-3)
+
+        dt_p1_p3 = gen.compute_p1_p3_delay(
+            self.synthetic_amplitude_deg,
+            actual_beat_period=mean_beat_period,
+        )
+        dt_p1_p2 = 0.28 * dt_p1_p3
+
+        n_samples = int(round(max(min_duration_s, 2.0) * fs))
+        signal = np.zeros(n_samples, dtype=np.float64)
+        block_duration_s = n_samples / float(fs)
+
+        kernel_len = int(0.0025 * fs)
+        t_k = np.arange(kernel_len, dtype=np.float64) / fs
+
+        tau_p1, tau_p2, tau_p3 = 0.00015, 0.00018, 0.00020
+        env_p1 = (t_k / (tau_p1 * 0.25)) * np.exp(-t_k / tau_p1)
+        env_p1 /= np.max(env_p1) + 1e-12
+        env_p2 = (t_k / (tau_p2 * 0.25)) * np.exp(-t_k / tau_p2)
+        env_p2 /= np.max(env_p2) + 1e-12
+        env_p3 = (t_k / (tau_p3 * 0.25)) * np.exp(-t_k / tau_p3)
+        env_p3 /= np.max(env_p3) + 1e-12
+
+        carrier_p1 = 0.6 * np.sin(2.0 * np.pi * 7200.0 * t_k) + 0.4 * np.sin(
+            2.0 * np.pi * 12400.0 * t_k
+        )
+        carrier_p2 = 0.5 * np.sin(2.0 * np.pi * 8500.0 * t_k) + 0.5 * np.sin(
+            2.0 * np.pi * 14200.0 * t_k
+        )
+        carrier_p3 = 0.55 * np.sin(2.0 * np.pi * 9600.0 * t_k) + 0.45 * np.sin(
+            2.0 * np.pi * 15500.0 * t_k
+        )
+
+        wave_p1 = 0.55 * env_p1 * carrier_p1
+        wave_p2 = 0.45 * env_p2 * carrier_p2
+        wave_p3 = 1.00 * env_p3 * carrier_p3
+
+        current_p1 = self._synth_next_p1_s
+        beat_idx = self._synth_beat_idx
+
+        while current_p1 + dt_p1_p3 + 0.005 < block_duration_s:
+            gen._add_sub_sample_impulse(signal, current_p1, wave_p1, fs)
+            gen._add_sub_sample_impulse(signal, current_p1 + dt_p1_p2, wave_p2, fs)
+            gen._add_sub_sample_impulse(signal, current_p1 + dt_p1_p3, wave_p3, fs)
+
+            interval = (
+                mean_beat_period + half_be_s if beat_idx % 2 == 0 else mean_beat_period - half_be_s
+            )
+            current_p1 += interval
+            beat_idx += 1
+
+        # Cut the block in the quiet inter-beat region right before the next unplaced beat
+        cut_s = max(0.5, min(block_duration_s, current_p1 - 0.010))
+        cut_samples = max(1, min(n_samples, int(np.floor(cut_s * fs))))
+        actual_cut_s = cut_samples / float(fs)
+        signal = signal[:cut_samples]
+
+        self._synth_next_p1_s = max(0.005, current_p1 - actual_cut_s)
+        self._synth_beat_idx = beat_idx
+
+        if self.synthetic_snr_db is not None:
+            sig_power = float(np.mean(signal**2))
+            if sig_power > 0.0:
+                noise_power = sig_power / (10.0 ** (self.synthetic_snr_db / 10.0))
+                signal = signal + gen.rng.normal(0.0, np.sqrt(noise_power), size=len(signal))
+
+        return signal
+
+    def _next_synthetic_chunk(self, num_samples: int) -> NDArray[np.float64]:
+        """Extract the next ``num_samples`` from the phase-continuous synthetic stream."""
+        remaining = len(self._synth_buffer) - self._synth_cursor
+        if remaining < num_samples:
+            leftover = (
+                self._synth_buffer[self._synth_cursor :]
+                if remaining > 0
+                else np.empty(0, dtype=np.float64)
+            )
+            need_s = max(6.0, (num_samples / float(self.config.sample_rate)) + 2.0)
+            fresh = self._generate_phase_continuous_block(min_duration_s=need_s)
+            if len(leftover) > 0:
+                combined = np.empty(len(leftover) + len(fresh), dtype=np.float64)
+                combined[: len(leftover)] = leftover
+                combined[len(leftover) :] = fresh
+                self._synth_buffer = combined
+            else:
+                self._synth_buffer = fresh
+            self._synth_cursor = 0
+
+        chunk = self._synth_buffer[self._synth_cursor : self._synth_cursor + num_samples].copy()
+        self._synth_cursor += num_samples
+        return chunk
+
+    @pyqtSlot()
+    def start_stream(self) -> None:
+        """Start streaming analysis (activating the synthetic chunk timer if in synthetic mode)."""
+        logger.info(
+            "DSPStreamWorker starting stream (synthetic_mode=%s, bph=%d, lift=%.1f, fs=%d)",
+            self.synthetic_mode,
+            self.config.bph,
+            self.config.lift_angle,
+            self.config.sample_rate,
+        )
+        self._running = True
+        self._receiving_external_chunks = False
+        self._samples_since_last_analysis = 0
+        self._has_emitted_telemetry = False
+        self.ring_buffer.clear()
+        self.drift_estimator.reset()
+        self.dsp_engine.reset_filter_state()
+        self._reset_synthetic_state()
+
+        if self.synthetic_mode:
+            interval_ms = self._timer_interval_ms()
+            self._sig_start_timer.emit(interval_ms)
+
+    @pyqtSlot()
+    def stop_stream(self) -> None:
+        """Stop the active stream and halt the synthetic simulation timer."""
+        was_running = self._running
+        self._running = False
+        self._sig_stop_timer.emit()
+        logger.info("DSPStreamWorker stream stopped")
+        if was_running:
+            self.session_finished.emit()
+
+    stop = stop_stream
+
+    @pyqtSlot(object)
+    def update_watch_config(self, config: WatchConfig) -> None:
+        """Update WatchConfig (BPH, lift angle, sample rate) in real time."""
+        try:
+            if not isinstance(config, WatchConfig):
+                raise TypeError(f"Expected WatchConfig instance, got {type(config).__name__}")
+
+            fs_changed = config.sample_rate != self.config.sample_rate
+            self.config = config
+
+            if fs_changed:
+                new_capacity = int(round(self.buffer_duration_s * config.sample_rate))
+                self.ring_buffer = AudioRingBuffer(capacity_samples=new_capacity)
+                self.drift_estimator.nominal_fs = float(config.sample_rate)
+                self.drift_estimator.reset()
+                self.dsp_engine._sos = self.dsp_engine._design_highpass_sos(
+                    float(config.sample_rate),
+                    self.dsp_engine.highpass_cutoff_hz,
+                    self.dsp_engine.filter_order,
+                )
+
+            self.dsp_engine.config = config
+            self.dsp_engine.reset_filter_state()
+            self._recompute_window_thresholds()
+            self._samples_since_last_analysis = 0
+            self._reset_synthetic_state()
+
+            if self._running and self.synthetic_mode and not self._receiving_external_chunks:
+                self.ring_buffer.clear()
+                self._sig_start_timer.emit(self._timer_interval_ms())
+
+            logger.info(
+                "DSPStreamWorker updated WatchConfig (bph=%d, lift=%.1f deg, fs=%d Hz)",
+                config.bph,
+                config.lift_angle,
+                config.sample_rate,
+            )
+        except Exception as exc:
+            logger.error("Failed to update WatchConfig in DSPStreamWorker: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    @pyqtSlot(float)
+    def set_calibration_ppm(self, ppm: float) -> None:
+        """Update static clock drift calibration offset in parts per million."""
+        try:
+            self.drift_estimator.calibration_ppm = float(ppm)
+            eff_fs = self.drift_estimator.effective_fs
+            total_ppm = self.drift_estimator.drift_ppm
+            bias_spd = self.drift_estimator.rate_bias_spd
+            logger.info(
+                "DSPStreamWorker calibration_ppm updated to %+.3f ppm (effective_fs=%.4f Hz)",
+                self.drift_estimator.calibration_ppm,
+                eff_fs,
+            )
+            self.drift_updated.emit(eff_fs, total_ppm, bias_spd)
+        except Exception as exc:
+            logger.error("Failed to set calibration_ppm in DSPStreamWorker: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    @pyqtSlot(float)
+    def set_cpu_skew_ppm(self, skew_ppm: float) -> None:
+        """Update host CPU monotonic clock skew offset (from AtomicNTPDiscipline) in ppm."""
+        try:
+            self.drift_estimator.cpu_skew_ppm = float(skew_ppm)
+            eff_fs = self.drift_estimator.effective_fs
+            total_ppm = self.drift_estimator.drift_ppm
+            bias_spd = self.drift_estimator.rate_bias_spd
+            logger.info(
+                "DSPStreamWorker cpu_skew_ppm updated to %+.3f ppm (effective_fs=%.4f Hz)",
+                self.drift_estimator.cpu_skew_ppm,
+                eff_fs,
+            )
+            self.drift_updated.emit(eff_fs, total_ppm, bias_spd)
+        except Exception as exc:
+            logger.error("Failed to set cpu_skew_ppm in DSPStreamWorker: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    @pyqtSlot()
+    def _on_synthetic_timer_tick(self) -> None:
+        """Feed a synthetic audio chunk into the DSP pipeline on each timer tick."""
+        if not self._running or not self.synthetic_mode or self._receiving_external_chunks:
+            return
+        try:
+            if self.ring_buffer.available_samples < self._min_analysis_samples:
+                warmup_needed = max(
+                    0,
+                    self._min_analysis_samples - self.ring_buffer.available_samples,
+                )
+                if warmup_needed > 0:
+                    warmup_chunk = self._next_synthetic_chunk(warmup_needed)
+                    self.ring_buffer.write(warmup_chunk)
+                    self._samples_since_last_analysis += len(warmup_chunk)
+
+            chunk = self._next_synthetic_chunk(self.chunk_size)
+            self._ingest_chunk(chunk)
+        except Exception as exc:
+            logger.error("Error in synthetic timer tick: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    @pyqtSlot(object)
+    def push_audio_chunk(
+        self,
+        chunk: NDArray[np.float64],
+        timestamp_ns: int | None = None,
+    ) -> None:
+        """Ingest an external audio chunk into the ring buffer and trigger DSP analysis.
+
+        Args:
+            chunk: 1D float64 NumPy array of audio samples.
+            timestamp_ns: Optional monotonic timestamp in nanoseconds for drift estimation.
+        """
+        self._receiving_external_chunks = True
+        self._ingest_chunk(chunk, timestamp_ns=timestamp_ns)
+
+    def _ingest_chunk(
+        self,
+        chunk: NDArray[np.float64],
+        timestamp_ns: int | None = None,
+    ) -> None:
+        """Write chunk to ring buffer, update clock drift estimator, and run DSP when ready."""
+        try:
+            if chunk is None:
+                raise ValueError("Audio chunk must not be None")
+
+            samples = np.asarray(chunk, dtype=np.float64).ravel()
+            n_samples = int(samples.size)
+            if n_samples == 0:
+                return
+
+            self.ring_buffer.write(samples)
+            effective_fs = self.drift_estimator.update(n_samples, timestamp_ns=timestamp_ns)
+            self.drift_updated.emit(
+                float(effective_fs),
+                float(self.drift_estimator.drift_ppm),
+                float(self.drift_estimator.rate_bias_spd),
+            )
+
+            self._samples_since_last_analysis += n_samples
+
+            if (
+                self.ring_buffer.available_samples >= self._min_analysis_samples
+                and self._samples_since_last_analysis >= self._analysis_hop_samples
+            ):
+                self._samples_since_last_analysis = 0
+                window = self.ring_buffer.read_latest(self._window_samples)
+                telemetry: BeatTelemetry = self.dsp_engine.process_window(
+                    window,
+                    bph=self.config.bph,
+                    lift_angle=self.config.lift_angle,
+                    effective_fs=effective_fs,
+                    streaming=False,
+                )
+                self._has_emitted_telemetry = True
+                self.telemetry_ready.emit(telemetry)
+
+                time_axis, wave_win = self._extract_waveform_window(
+                    window,
+                    effective_fs=effective_fs,
+                    step_idx=self._waveform_step_idx,
+                    window_ms=self.WAVEFORM_WINDOW_MS,
+                )
+                self._waveform_step_idx += 1
+                self.waveform_ready.emit(time_axis, wave_win)
+            elif not self._has_emitted_telemetry:
+                time_axis, wave_win = self._extract_waveform_window(
+                    samples,
+                    effective_fs=effective_fs,
+                    step_idx=self._waveform_step_idx,
+                    window_ms=self.WAVEFORM_WINDOW_MS,
+                )
+                self._waveform_step_idx += 1
+                self.waveform_ready.emit(time_axis, wave_win)
+
+        except Exception as exc:
+            logger.error("DSPStreamWorker chunk processing error: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    @staticmethod
+    def _extract_waveform_window(
+        signal: NDArray[np.float64],
+        effective_fs: float,
+        step_idx: int = 0,
+        window_ms: float = 600.0,
+        max_bins: int = 2000,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Extract a scrolling audio waveform window normalized to [-1.0, 1.0] with peak decimation."""
+        n_pts = int(signal.size)
+        fs = max(1.0, float(effective_fs))
+        if n_pts == 0:
+            empty = np.empty(0, dtype=np.float64)
+            return empty, empty
+
+        chunk_samples = max(16, int(round((window_ms / 1000.0) * fs)))
+        if n_pts <= chunk_samples:
+            seg = signal
+        else:
+            max_start = max(1, n_pts - chunk_samples)
+            start_idx = (step_idx * int(round(0.035 * fs))) % max_start
+            seg = signal[start_idx : start_idx + chunk_samples]
+
+        peak = float(np.max(np.abs(seg)))
+        norm_stream = (seg / peak) if peak > 1e-12 else np.zeros_like(seg)
+        n_seg = len(norm_stream)
+
+        if n_seg > max_bins * 2:
+            bin_size = n_seg // max_bins
+            n_trim = bin_size * max_bins
+            reshaped = norm_stream[:n_trim].reshape(max_bins, bin_size)
+            y_min = np.min(reshaped, axis=1)
+            y_max = np.max(reshaped, axis=1)
+            y_dec = np.empty(max_bins * 2, dtype=np.float64)
+            y_dec[0::2] = y_min
+            y_dec[1::2] = y_max
+            t_ms = np.linspace(0.0, (n_trim / fs) * 1000.0, max_bins * 2, dtype=np.float64)
+            return t_ms, y_dec
+
+        t_ms = (np.arange(n_seg, dtype=np.float64) / fs) * 1000.0
+        return t_ms, norm_stream.astype(np.float64, copy=True)
+
+    @pyqtSlot()
+    def shutdown(self) -> None:
+        """Stop streaming and cleanly shut down the DSPEngine worker pool."""
+        self.stop_stream()
+        self.dsp_engine.shutdown(wait=True)
+        logger.info("DSPStreamWorker shut down cleanly")

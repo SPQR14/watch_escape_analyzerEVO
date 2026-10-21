@@ -74,6 +74,13 @@ class Translator:
             "status_stabilizing": "STABILIZING...",
             "status_running": "MEASURING",
             "status_completed": "COMPLETED",
+            "clock_drift": "Clock Drift",
+            "effective_fs": "Effective Sample Rate",
+            "drift_ppm": "Drift (ppm)",
+            "rate_bias": "Drift Bias",
+            "status_drift_format": (
+                "Clock Drift: {ppm:+.2f} ppm | Effective Fs: {fs:.2f} Hz | Bias: {bias:+.2f} s/d"
+            ),
         },
         "es": {
             "app_title": "Watch Escape Analyzer EVO — Banco de Pruebas DSP Horológico",
@@ -138,6 +145,13 @@ class Translator:
             "status_stabilizing": "ESTABILIZANDO...",
             "status_running": "MIDIENDO",
             "status_completed": "COMPLETADO",
+            "clock_drift": "Deriva de Reloj",
+            "effective_fs": "Frec. Muestreo Efectiva",
+            "drift_ppm": "Deriva (ppm)",
+            "rate_bias": "Sesgo de Marcha",
+            "status_drift_format": (
+                "Deriva de Reloj: {ppm:+.2f} ppm | Fs Efectiva: {fs:.2f} Hz | Sesgo: {bias:+.2f} s/d"
+            ),
         },
     }
 
