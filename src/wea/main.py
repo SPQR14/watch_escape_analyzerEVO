@@ -23,7 +23,10 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
 
-    logger.critical("Unhandled global exception", exc_info=(exc_type, exc_value, exc_traceback))
+    logger.critical(
+        "Unhandled global exception",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,10 +46,12 @@ def main(argv: list[str] | None = None) -> int:
         # Will fail here if the translation file is missing or corrupted
         translator = Translator("en")
 
-        # Will fail here if the UI tries to load a missing asset or invalid layout
+        # Will fail here if the UI tries to load a missing asset or invalid
+        # layout.
         window = MainWin(translator=translator)
 
-        # NOTE: Instantiate the DSPEngine and audio interface here in the future
+        # NOTE: Instantiate the DSPEngine and audio interface here in the
+        # future.
 
     except Exception as e:
         logger.critical(f"Critical failure during initialization: {e}")
