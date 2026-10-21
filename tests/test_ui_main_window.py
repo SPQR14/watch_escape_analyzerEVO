@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import os
 from pathlib import Path
+
 import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtPrintSupport import QPrinter
@@ -118,8 +119,12 @@ def test_main_window_layout_and_i18n_switching(tmp_path: Path) -> None:
         amplitude_deg=278.0,
         confidence=0.96,
     )
-    win._on_telemetry_updated(fake_telemetry, [fake_beat], elapsed_s=4.5, snr_db=39.2, audio_chunk=fake_wave)
-    win._on_telemetry_updated(fake_telemetry, [fake_beat], elapsed_s=5.0, snr_db=39.2, audio_chunk=fake_wave)
+    win._on_telemetry_updated(
+        fake_telemetry, [fake_beat], elapsed_s=4.5, snr_db=39.2, audio_chunk=fake_wave
+    )
+    win._on_telemetry_updated(
+        fake_telemetry, [fake_beat], elapsed_s=5.0, snr_db=39.2, audio_chunk=fake_wave
+    )
 
     assert win.card_rate.value_label.text() == "+5.4"
     assert win.card_beat_error.value_label.text() == "0.35"
