@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import struct
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-from wea.core.clock_drift import SampleRateDriftEstimator
+from wea.core.clock_drift import AtomicNTPDiscipline, SampleRateDriftEstimator
 from wea.core.dsp_engine import DSPEngine
 from wea.core.models import BeatTelemetry, WatchConfig
 from wea.core.synthetic import SyntheticEscapeGenerator
@@ -81,6 +83,139 @@ def test_sample_rate_drift_estimator_quartz_calibration() -> None:
     assert abs(cal_ppm - true_drift_ppm) < 0.5
     assert abs(((estimator.effective_fs - true_fs) / nominal_fs) * 1e6) < 0.5
     assert abs(estimator.rate_bias_spd - expected_rate_bias_spd) < 0.04
+
+
+def test_sample_rate_drift_estimator_decimated_ols_and_ema_three_layer_fusion() -> None:
+    """Verify decimated OLS (recalc_interval_sec=0.5), EMA smoothing, and 3-layer effective_fs."""
+    nominal_fs = 48000.0
+    true_adc_drift_ppm = 50.0
+    cal_ppm = 12.0
+    cpu_skew_ppm = 4.0
+    true_dynamic_fs = nominal_fs * (1.0 + true_adc_drift_ppm * 1e-6)
+
+    estimator = SampleRateDriftEstimator(
+        nominal_fs=nominal_fs,
+        window_sec=30.0,
+        min_duration_sec=5.0,
+        min_chunks=10,
+        recalc_interval_sec=0.5,
+        ema_alpha=0.15,
+        calibration_ppm=cal_ppm,
+        cpu_skew_ppm=cpu_skew_ppm,
+    )
+
+    rng = np.random.default_rng(2026)
+    chunk_dt_sec = 0.05  # 20 chunks/sec (high rate)
+    chunk_samples = true_dynamic_fs * chunk_dt_sec
+    base_ns = 2_000_000_000_000
+
+    # Feed 300 chunks (15.0 seconds total; 10.0 seconds after min_duration_sec=5.0s)
+    for step in range(301):
+        jitter_ns = int(rng.normal(0.0, 500.0)) if step > 0 else 0
+        t_ns = base_ns + int(round(step * chunk_dt_sec * 1e9)) + jitter_ns
+        estimator.update(chunk_samples=chunk_samples, timestamp_ns=t_ns)
+
+    assert estimator.is_converged is True
+    # Over 10 seconds of active OLS with recalc_interval_sec=0.5, OLS runs ~21 times (not 201 times)
+    assert 18 <= estimator._ols_eval_count <= 23
+
+    expected_eff_fs = true_dynamic_fs * (1.0 + (cal_ppm - cpu_skew_ppm) * 1e-6)
+    eff_fs_err_ppm = abs((estimator.effective_fs - expected_eff_fs) / nominal_fs) * 1e6
+    assert eff_fs_err_ppm < 0.5
+
+
+def _pack_ntp_response(t2_unix: float, t3_unix: float) -> bytes:
+    """Build a synthetic 48-byte NTPv3 server response with T2 and T3 timestamps."""
+    epoch_offset = AtomicNTPDiscipline.NTP_EPOCH_OFFSET
+    two_pow_32 = AtomicNTPDiscipline.TWO_POW_32
+
+    t2_ntp = t2_unix + epoch_offset
+    t2_sec = int(t2_ntp)
+    t2_frac = int(round((t2_ntp - t2_sec) * two_pow_32)) & 0xFFFFFFFF
+
+    t3_ntp = t3_unix + epoch_offset
+    t3_sec = int(t3_ntp)
+    t3_frac = int(round((t3_ntp - t3_sec) * two_pow_32)) & 0xFFFFFFFF
+
+    header_32 = b"\x1c" + 31 * b"\x00"
+    timestamps_16 = struct.pack("!4I", t2_sec, t2_frac, t3_sec, t3_frac)
+    return header_32 + timestamps_16
+
+
+def test_atomic_ntp_discipline_minimum_delay_filter_and_cpu_skew_offline() -> None:
+    """Verify AtomicNTPDiscipline minimum-delay hull filter and cpu_skew_ppm entirely offline."""
+    discipline = AtomicNTPDiscipline(host="time.cloudflare.com", port=123, timeout_sec=0.4)
+
+    # Burst 1 (anchor at t_atomic = 1_700_000_000.0, t_local = 100.0):
+    # Packet 0: RTT = 50 ms, Packet 1: RTT = 8 ms (minimum delay!), Packet 2: RTT = 35 ms, Packet 3: RTT = 60 ms
+    t_atomic_0 = 1_700_000_000.0
+    burst1_packets = [
+        (_pack_ntp_response(t_atomic_0 + 0.020, t_atomic_0 + 0.021), ("162.159.200.1", 123)),
+        (_pack_ntp_response(t_atomic_0 + 0.104, t_atomic_0 + 0.104), ("162.159.200.1", 123)),
+        (_pack_ntp_response(t_atomic_0 + 0.215, t_atomic_0 + 0.216), ("162.159.200.1", 123)),
+        (_pack_ntp_response(t_atomic_0 + 0.325, t_atomic_0 + 0.326), ("162.159.200.1", 123)),
+    ]
+    # Corresponding (T1, T4) monotonic timestamps in seconds converted to ns:
+    # Packet 0: T1=100.000, T4=100.051 -> delta = 0.050s
+    # Packet 1: T1=100.100, T4=100.108 -> delta = 0.008s (minimum!) -> local_mid=100.104, atomic_mid=t_atomic_0+0.104
+    # Packet 2: T1=100.200, T4=100.236 -> delta = 0.035s
+    # Packet 3: T1=100.300, T4=100.361 -> delta = 0.060s
+    burst1_t_ns = [
+        int(100.000 * 1e9),
+        int(100.051 * 1e9),
+        int(100.100 * 1e9),
+        int(100.108 * 1e9),
+        int(100.200 * 1e9),
+        int(100.236 * 1e9),
+        int(100.300 * 1e9),
+        int(100.361 * 1e9),
+    ]
+
+    mock_sock = MagicMock()
+    mock_sock.__enter__.return_value = mock_sock
+    mock_sock.recvfrom.side_effect = burst1_packets
+
+    with (
+        patch("socket.socket", return_value=mock_sock),
+        patch("time.perf_counter_ns", side_effect=burst1_t_ns),
+    ):
+        skew0 = discipline.update_cpu_skew(burst_size=4)
+
+    assert skew0 == 0.0
+    assert discipline._anchor is not None
+    assert discipline._anchor[0] == pytest.approx(100.104, abs=1e-6)
+    assert discipline._anchor[1] == pytest.approx(t_atomic_0 + 0.104, abs=1e-6)
+
+    # Burst 2: 20.0 atomic seconds later, with host CPU clock running +25.0 ppm fast
+    true_skew_ppm = 25.0
+    dt_atomic = 20.0
+    dt_local = dt_atomic * (1.0 + true_skew_ppm * 1e-6)
+    t_local_mid_2 = 100.104 + dt_local
+    t_atomic_mid_2 = (t_atomic_0 + 0.104) + dt_atomic
+
+    burst2_packets = [
+        (_pack_ntp_response(t_atomic_mid_2, t_atomic_mid_2), ("162.159.200.1", 123)),
+    ]
+    burst2_t_ns = [
+        int(round((t_local_mid_2 - 0.004) * 1e9)),
+        int(round((t_local_mid_2 + 0.004) * 1e9)),
+    ]
+    mock_sock.recvfrom.side_effect = burst2_packets
+
+    with (
+        patch("socket.socket", return_value=mock_sock),
+        patch("time.perf_counter_ns", side_effect=burst2_t_ns),
+    ):
+        skew1 = discipline.update_cpu_skew(burst_size=1)
+
+    # First EMA step (0.3 * 25.0 + 0.7 * 0.0 = 7.5 ppm)
+    assert skew1 == pytest.approx(0.3 * true_skew_ppm, abs=0.05)
+
+    # Offline / OSError resilience: returns None from sample_burst and preserves cpu_skew_ppm
+    mock_sock.recvfrom.side_effect = OSError("Network unreachable")
+    with patch("socket.socket", return_value=mock_sock):
+        assert discipline.sample_burst(burst_size=2) is None
+        assert discipline.update_cpu_skew(burst_size=2) == pytest.approx(skew1, abs=1e-9)
 
 
 @pytest.mark.parametrize(

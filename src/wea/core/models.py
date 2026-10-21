@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -102,6 +102,11 @@ class BeatTelemetry:
         beat_times_sec: Detected beat timestamps in seconds.
         envelope: Smoothed analytic amplitude envelope of the signal.
         confidence: Detection confidence score in the range [0.0, 1.0].
+        snr_db: Acoustic Signal-to-Noise Ratio in decibels (dB).
+        beats: Detected BeatEvent instances with P1, P2, and P3 timestamps.
+        micro_envelope: High-resolution sub-millisecond envelope for P1/P2/P3 inspection.
+        filtered_signal: High-pass filtered acoustic waveform.
+        effective_fs: Effective sampling frequency in Hz used during analysis.
     """
 
     rate_spd: float
@@ -110,3 +115,12 @@ class BeatTelemetry:
     beat_times_sec: NDArray[np.float64]
     envelope: NDArray[np.float64]
     confidence: float
+    snr_db: float = 0.0
+    beats: list[BeatEvent] = field(default_factory=list)
+    micro_envelope: NDArray[np.float64] = field(
+        default_factory=lambda: np.empty(0, dtype=np.float64)
+    )
+    filtered_signal: NDArray[np.float64] = field(
+        default_factory=lambda: np.empty(0, dtype=np.float64)
+    )
+    effective_fs: float = 48000.0

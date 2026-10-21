@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -43,11 +43,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from wea.audio.ring_buffer import AudioRingBuffer
 from wea.core.dsp_pipeline import EscapeDSPPipeline
-from wea.core.models import BeatEvent, TelemetryResult, WatchConfig
+from wea.core.models import BeatEvent, BeatTelemetry, TelemetryResult, WatchConfig
+from wea.core.ring_buffer import AudioRingBuffer
 from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.i18n.translator import Translator
+from wea.ui.dsp_worker import DSPStreamWorker
 from wea.utils.audio_io import (
     is_flac_supported,
     save_audio_recording,
@@ -58,20 +59,18 @@ from wea.utils.watch_db import load_watch_db
 logger = LoggerSetup.setup_logger(__name__)
 
 
-def configure_pyqtgraph_gpu() -> bool:
-    """Configure PyQtGraph OpenGL GPU hardware acceleration when not in offscreen mode.
+def configure_pyqtgraph_gpu(enable_opengl: bool = False) -> bool:
+    """Configure PyQtGraph rendering options with experimental OpenGL disabled by default.
 
-    Checks ``QT_QPA_PLATFORM == "offscreen"`` for headless/CI environments. When not in
-    offscreen mode, enables GPU hardware acceleration via
-    ``pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=False)``
-    and configures ``QSurfaceFormat``, falling back gracefully to CPU rendering with a
-    warning log if ``PyOpenGL`` is not installed or OpenGL setup fails.
+    Experimental OpenGL in PyQt6 causes multi-color vertex tearing on overlaid curves,
+    so standard CPU rendering is used by default unless ``enable_opengl=True`` is
+    explicitly passed in a non-headless session.
     """
     pg.setConfigOptions(background="#0d1015", foreground="#9aa5b4")
-    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
-        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=False)
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen" or not enable_opengl:
+        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=True)
         logger.info(
-            "Headless mode detected (QT_QPA_PLATFORM=offscreen); using CPU rendering for PyQtGraph"
+            "Configured PyQtGraph standard CPU rendering (useOpenGL=False, enableExperimental=False)"
         )
         return False
 
@@ -83,18 +82,15 @@ def configure_pyqtgraph_gpu() -> bool:
         fmt.setSamples(0)
         QSurfaceFormat.setDefaultFormat(fmt)
 
-        pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=False)
-        logger.info(
-            "Enabled PyQtGraph GPU hardware acceleration "
-            "(useOpenGL=True, enableExperimental=True, antialias=False)"
-        )
+        pg.setConfigOptions(useOpenGL=True, enableExperimental=False, antialias=True)
+        logger.info("Enabled PyQtGraph OpenGL rendering with enableExperimental=False")
         return True
     except Exception as exc:
         logger.warning(
-            "PyQtGraph OpenGL GPU acceleration unavailable (%s); falling back to CPU rendering",
+            "PyQtGraph OpenGL unavailable (%s); falling back to CPU rendering",
             exc,
         )
-        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=False)
+        pg.setConfigOptions(useOpenGL=False, enableExperimental=False, antialias=True)
         return False
 
 
@@ -347,10 +343,15 @@ class MainWin(QMainWindow):
         self._tape_rate_odd: list[float] = []
         self._last_telemetry: TelemetryResult | None = None
         self._session_records: list[dict[str, float | str | int]] = []
+        self._capture_start_monotonic: float | None = None
+        self._last_effective_fs: float = 48000.0
+        self._last_drift_ppm: float = 0.0
+        self._last_rate_bias_spd: float = 0.0
+        self._osc_rng = np.random.default_rng(2026)
 
         # Audio recording state (same duration as test)
         self._recorded_audio: np.ndarray | None = None
-        self._recorded_sample_rate: int = 96000
+        self._recorded_sample_rate: int = 48000
         self._save_audio_on_finish: bool = False
 
         # Saved positional telemetry records (starts clean with no pre-populated data)
@@ -359,6 +360,28 @@ class MainWin(QMainWindow):
         self.setMinimumSize(1360, 840)
         self._apply_industrial_theme()
         self._build_ui()
+
+        # Real-time Qt DSP worker living in a dedicated QThread via moveToThread
+        self.dsp_thread = QThread(self)
+        self.dsp_worker = DSPStreamWorker(config=self.current_watch_config())
+        self.dsp_worker.moveToThread(self.dsp_thread)
+        self.dsp_worker.telemetry_ready.connect(self._on_telemetry_ready)
+        self.dsp_worker.waveform_ready.connect(self._on_waveform_ready)
+        self.dsp_worker.drift_updated.connect(self._on_drift_updated)
+        self.dsp_worker.error_occurred.connect(self._on_worker_error)
+        self.dsp_worker.session_finished.connect(self._on_session_finished)
+        self.dsp_thread.start()
+
+        # Wire UI controls to update DSPStreamWorker configuration in real time
+        self.cmb_bph.currentTextChanged.connect(self._on_watch_config_changed)
+        self.spn_lift.valueChanged.connect(self._on_watch_config_changed)
+        self.cmb_srate.currentIndexChanged.connect(self._on_watch_config_changed)
+
+        # Timer enforcing automatic test completion at (stabilization_s + duration_s)
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(100)
+        self._session_timer.timeout.connect(self._check_session_duration)
+
         self.retranslate_ui()
         self._refresh_global_stats_table()
         logger.info(
@@ -779,14 +802,14 @@ class MainWin(QMainWindow):
         self._populate_audio_devices()
         self._configure_combo_box(self.cmb_device, min_width=230)
 
-        # Sample Rate
+        # Sample Rate (default 48 kHz)
         self.lbl_srate = QLabel()
         self.lbl_srate.setObjectName("TopBarLabel")
         self.cmb_srate = QComboBox()
         self.cmb_srate.addItem("48 kHz", 48000)
         self.cmb_srate.addItem("96 kHz", 96000)
         self._configure_combo_box(self.cmb_srate, min_width=96)
-        self.cmb_srate.setCurrentIndex(1)
+        self.cmb_srate.setCurrentIndex(0)
 
         # Stabilization time
         self.lbl_stab = QLabel()
@@ -932,6 +955,11 @@ class MainWin(QMainWindow):
         self.lbl_stat_elapsed_val.setObjectName("StatValue")
         self.lbl_stat_elapsed_val.setAlignment(Qt.AlignmentFlag.AlignRight)
 
+        self.lbl_stat_drift_key = QLabel()
+        self.lbl_stat_drift_val = QLabel("")
+        self.lbl_stat_drift_val.setObjectName("StatValue")
+        self.lbl_stat_drift_val.setAlignment(Qt.AlignmentFlag.AlignRight)
+
         for row_idx, (k_lbl, v_lbl) in enumerate(
             (
                 (self.lbl_stat_max_key, self.lbl_stat_max_val),
@@ -939,6 +967,7 @@ class MainWin(QMainWindow):
                 (self.lbl_stat_delta_key, self.lbl_stat_delta_val),
                 (self.lbl_stat_mean_key, self.lbl_stat_mean_val),
                 (self.lbl_stat_elapsed_key, self.lbl_stat_elapsed_val),
+                (self.lbl_stat_drift_key, self.lbl_stat_drift_val),
             )
         ):
             stats_grid.addWidget(k_lbl, row_idx, 0)
@@ -1146,6 +1175,7 @@ class MainWin(QMainWindow):
 
         self.oscilloscope_plot = pg.PlotWidget()
         self.oscilloscope_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.oscilloscope_plot.setYRange(-1.1, 1.1)
         self.oscilloscope_plot.addLegend(offset=(10, 10))
 
         self.osc_wave_curve = self.oscilloscope_plot.plot(
@@ -1250,6 +1280,11 @@ class MainWin(QMainWindow):
         content_layout.addWidget(self.splitter)
         root_layout.addLayout(content_layout, stretch=1)
 
+        # Status bar with live clock drift telemetry indicator
+        self.lbl_drift_status = QLabel()
+        self.lbl_drift_status.setObjectName("StatValue")
+        self.statusBar().addPermanentWidget(self.lbl_drift_status)
+
     def _populate_audio_devices(self) -> None:
         """Populate input audio device selector with synthetic generator and hardware inputs."""
         self.cmb_device.clear()
@@ -1276,12 +1311,19 @@ class MainWin(QMainWindow):
             bph, lift_angle = CALIBER_PRESETS[caliber_name]
             self.cmb_bph.setCurrentText(str(bph))
             self.spn_lift.setValue(lift_angle)
+            self._on_watch_config_changed()
             logger.info(
                 "Caliber selection changed to '%s' (bph=%d, lift_angle=%.1f deg)",
                 caliber_name,
                 bph,
                 lift_angle,
             )
+
+    def _on_watch_config_changed(self, *_args: object) -> None:
+        """Forward live WatchConfig changes (BPH, Lift Angle, Sample Rate) to DSPStreamWorker."""
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            cfg = self.current_watch_config()
+            self.dsp_worker.update_watch_config(cfg)
 
     def _on_language_changed(self, index: int) -> None:
         """Switch active language in Translator and refresh all UI texts."""
@@ -1843,6 +1885,14 @@ class MainWin(QMainWindow):
         self.lbl_stat_delta_key.setText(f"{tr('stat_delta')}:")
         self.lbl_stat_mean_key.setText(f"{tr('stat_mean')}:")
         self.lbl_stat_elapsed_key.setText(f"{tr('stat_elapsed')}:")
+        self.lbl_stat_drift_key.setText(f"{tr('clock_drift')}:")
+        self.lbl_drift_status.setText(
+            tr("status_drift_format").format(
+                ppm=self._last_drift_ppm,
+                fs=self._last_effective_fs,
+                bias=self._last_rate_bias_spd,
+            )
+        )
 
         self.btn_save_position.setText(tr("btn_save_position"))
         self.btn_save_csv.setText(tr("btn_save_csv"))
@@ -1879,12 +1929,36 @@ class MainWin(QMainWindow):
         """Build a `WatchConfig` instance from the active Top Bar controls."""
         bph = int(self.cmb_bph.currentData() or int(self.cmb_bph.currentText()))
         lift_angle = float(self.spn_lift.value())
-        sample_rate = int(self.cmb_srate.currentData() or 96000)
+        sample_rate = int(self.cmb_srate.currentData() or 48000)
         return WatchConfig(bph=bph, lift_angle=lift_angle, sample_rate=sample_rate)
 
+    def _check_session_duration(self) -> None:
+        """Automatically stop capture once (stabilization_s + duration_s) has elapsed."""
+        if self._capture_start_monotonic is None:
+            return
+        elapsed_s = max(0.0, time.monotonic() - self._capture_start_monotonic)
+        stab_s = float(self.spn_stab.value())
+        duration_s = float(self.spn_duration.value())
+        total_limit_s = stab_s + duration_s
+
+        display_s = min(elapsed_s, total_limit_s)
+        mins = int(display_s) // 60
+        secs = display_s % 60.0
+        self.lbl_stat_elapsed_val.setText(f"{mins:02d}:{secs:04.1f}")
+
+        if elapsed_s >= total_limit_s:
+            logger.info(
+                "Configured test duration reached (stab=%.1fs + duration=%.1fs); stopping capture",
+                stab_s,
+                duration_s,
+            )
+            self.stop_capture()
+
     def start_capture(self) -> None:
-        """Start the synthetic DSP telemetry worker thread and reset plots."""
-        if self.worker is not None and self.worker.isRunning():
+        """Start the real-time DSPStreamWorker session and reset plots."""
+        if (self.worker is not None and self.worker.isRunning()) or (
+            self.dsp_worker is not None and self.dsp_worker.isRunning()
+        ):
             return
 
         logger.info("Starting telemetry capture session")
@@ -1895,6 +1969,7 @@ class MainWin(QMainWindow):
         self._tape_times_odd.clear()
         self._tape_rate_odd.clear()
         self._recorded_audio = None
+        self._capture_start_monotonic = time.monotonic()
 
         self.lbl_stat_max_val.setText("")
         self.lbl_stat_min_val.setText("")
@@ -1910,32 +1985,31 @@ class MainWin(QMainWindow):
         self.audio_waveform_curve.setData([], [])
 
         duration_s = float(self.spn_duration.value())
-        stab_s = float(self.spn_stab.value())
         self.paper_tape_plot.setXRange(0.0, max(10.0, duration_s))
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self._set_top_controls_enabled(False)
 
         config = self.current_watch_config()
         position = self.cmb_position.currentText()
+        base_rate, base_be, base_amp = POSITION_VARIATION.get(position, (+4.5, 0.35, 280.0))
 
-        self.worker = SyntheticTelemetryWorker(
-            config=config,
-            position=position,
-            stabilization_s=stab_s,
-            duration_s=duration_s,
-            parent=self,
-        )
-        self.worker.telemetry_updated.connect(self._on_telemetry_updated)
-        self.worker.recording_ready.connect(self._on_recording_ready)
-        self.worker.session_finished.connect(self._on_session_finished)
-        self.worker.start()
+        self.dsp_worker.synthetic_rate_spd = base_rate
+        self.dsp_worker.synthetic_beat_error_ms = base_be
+        self.dsp_worker.synthetic_amplitude_deg = base_amp
+        self.dsp_worker.update_watch_config(config)
+        self.dsp_worker.start_stream()
+        self._session_timer.start()
 
     def stop_capture(self) -> None:
-        """Stop the running background telemetry worker thread."""
+        """Stop the running background DSP worker."""
+        self._session_timer.stop()
+        self._capture_start_monotonic = None
+        if self.dsp_worker is not None and self.dsp_worker.isRunning():
+            logger.info("Stopping active DSPStreamWorker capture session")
+            self.dsp_worker.stop_stream()
         if self.worker is not None and self.worker.isRunning():
-            logger.info("Stopping active telemetry capture session")
+            logger.info("Stopping active SyntheticTelemetryWorker capture session")
             self.worker.stop()
             self.worker.wait(1500)
         self._on_session_finished()
@@ -2112,8 +2186,214 @@ class MainWin(QMainWindow):
                 t_stream_ms = (np.arange(n_pts, dtype=np.float64) / fs) * 1000.0
                 self.audio_waveform_curve.setData(t_stream_ms, norm_stream)
 
+    def _on_telemetry_ready(self, telemetry: BeatTelemetry | TelemetryResult) -> None:
+        """Slot receiving real-time BeatTelemetry from DSPStreamWorker."""
+        rate_spd = float(telemetry.rate_spd)
+        beat_error_ms = float(telemetry.beat_error_ms)
+        amplitude_deg = float(telemetry.amplitude_deg)
+        confidence = float(telemetry.confidence)
+
+        self._last_telemetry = TelemetryResult(
+            rate_spd=rate_spd,
+            beat_error_ms=beat_error_ms,
+            amplitude_deg=amplitude_deg,
+            confidence=confidence,
+        )
+
+        stab_s = float(self.spn_stab.value())
+        duration_s = float(self.spn_duration.value())
+
+        if self._capture_start_monotonic is not None:
+            elapsed_s = max(0.0, time.monotonic() - self._capture_start_monotonic)
+            should_record_tape = elapsed_s >= stab_s
+            t_meas = max(0.0, min(duration_s, elapsed_s - stab_s))
+        else:
+            elapsed_s = len(self._rate_history) * 0.25
+            should_record_tape = True
+            t_meas = elapsed_s
+
+        mins = int(elapsed_s) // 60
+        secs = elapsed_s % 60.0
+        self.lbl_stat_elapsed_val.setText(f"{mins:02d}:{secs:04.1f}")
+
+        raw_snr_db = float(getattr(telemetry, "snr_db", 0.0))
+        if raw_snr_db <= 0.0 and confidence > 0.0:
+            raw_snr_db = 38.0 * confidence
+        quality_pct = int(round(np.clip((raw_snr_db / 45.0) * 100.0 * confidence, 0.0, 100.0)))
+        self.prg_snr.setValue(quality_pct)
+        self.lbl_snr_value.setText(f"{raw_snr_db:.1f} dB ({quality_pct}%)")
+
+        sign_str = "+" if rate_spd >= 0 else ""
+        self.card_rate.set_value(f"{sign_str}{rate_spd:.1f}")
+        self.card_beat_error.set_value(f"{beat_error_ms:.2f}")
+        self.card_amplitude.set_value(f"{amplitude_deg:.0f}°")
+
+        cfg_now = self.current_watch_config()
+        if should_record_tape:
+            self._rate_history.append(rate_spd)
+            self._session_records.append(
+                {
+                    "test_name": self.txt_test_name.text().strip() or "watch_test",
+                    "caliber": self.cmb_caliber.currentText(),
+                    "bph": cfg_now.bph,
+                    "lift_angle": f"{cfg_now.lift_angle:.1f}",
+                    "sample_rate": cfg_now.sample_rate,
+                    "position": self.cmb_position.currentText(),
+                    "record_type": "sample",
+                    "elapsed_s": f"{t_meas:.2f}",
+                    "rate_spd": f"{rate_spd:.2f}",
+                    "beat_error_ms": f"{beat_error_ms:.2f}",
+                    "amplitude_deg": f"{amplitude_deg:.1f}",
+                    "confidence": f"{confidence:.3f}",
+                    "snr_db": f"{raw_snr_db:.1f}",
+                }
+            )
+
+            r_max = max(self._rate_history)
+            r_min = min(self._rate_history)
+            r_delta = r_max - r_min
+            r_mean = float(np.mean(self._rate_history))
+
+            self.lbl_stat_max_val.setText(f"{r_max:+.2f} s/d")
+            self.lbl_stat_min_val.setText(f"{r_min:+.2f} s/d")
+            self.lbl_stat_delta_val.setText(f"{r_delta:.2f} s/d")
+            self.lbl_stat_mean_val.setText(f"{r_mean:+.2f} s/d")
+
+            half_be_offset = 0.5 * beat_error_ms
+            self._tape_times_even.append(t_meas)
+            self._tape_rate_even.append(rate_spd - half_be_offset)
+            self._tape_times_odd.append(t_meas)
+            self._tape_rate_odd.append(rate_spd + half_be_offset)
+
+            self.tape_curve_even.setData(self._tape_times_even, self._tape_rate_even)
+            self.tape_curve_odd.setData(self._tape_times_odd, self._tape_rate_odd)
+
+        if isinstance(telemetry, BeatTelemetry):
+            fs = float(
+                telemetry.effective_fs
+                if getattr(telemetry, "effective_fs", 0.0) > 0.0
+                else cfg_now.sample_rate
+            )
+
+            # Bottom-Left Oscilloscope: beat-triggered bipolar waveform + envelope + P1/P2/P3
+            if telemetry.beats:
+                latest_beat = telemetry.beats[-1]
+                wave = latest_beat.raw_waveform.copy()
+                if len(wave) > 0:
+                    if self.dsp_worker.synthetic_mode:
+                        t_local = np.arange(len(wave), dtype=np.float64) / fs
+                        phase_shift = float(self._osc_rng.uniform(0.0, 2.0 * np.pi))
+                        mod = 1.0 + 0.14 * np.sin(2.0 * np.pi * 1100.0 * t_local + phase_shift)
+                        jitter_noise = self._osc_rng.normal(
+                            0.0, 0.03 * (float(np.max(np.abs(wave))) or 1.0), size=len(wave)
+                        )
+                        wave = (wave * mod) + jitter_noise
+
+                    peak_abs = float(np.max(np.abs(wave))) or 1.0
+                    norm_wave = wave / peak_abs
+                    t_ms = (np.arange(len(wave), dtype=np.float64) / fs) * 1000.0
+
+                    dt_p2 = (latest_beat.timestamp_p2 - latest_beat.timestamp_p1) * 1000.0
+                    dt_p3 = (latest_beat.timestamp_p3 - latest_beat.timestamp_p1) * 1000.0
+
+                    p3_idx = int(np.argmax(np.abs(norm_wave)))
+                    t_p3_ms = float(t_ms[p3_idx])
+                    t_p1_ms = max(0.2, t_p3_ms - dt_p3)
+                    t_p2_ms = float(np.clip(t_p1_ms + dt_p2, t_p1_ms, t_p3_ms))
+
+                    self.osc_wave_curve.setData(t_ms, norm_wave)
+                    env_win = max(int(round(0.00015 * fs)), 3)
+                    env_kernel = np.ones(env_win, dtype=np.float64) / float(env_win)
+                    norm_env = np.convolve(np.abs(norm_wave), env_kernel, mode="same")
+                    self.osc_envelope_curve.setData(t_ms, norm_env)
+                    self.line_p1.setPos(t_p1_ms)
+                    self.line_p2.setPos(t_p2_ms)
+                    self.line_p3.setPos(t_p3_ms)
+
+                    p1_idx = int(np.clip(round((t_p1_ms / 1000.0) * fs), 0, len(norm_wave) - 1))
+                    p2_idx = int(np.clip(round((t_p2_ms / 1000.0) * fs), 0, len(norm_wave) - 1))
+
+                    spots = [
+                        {
+                            "pos": (t_p1_ms, float(norm_wave[p1_idx])),
+                            "brush": pg.mkBrush("#00e676"),
+                            "pen": pg.mkPen("#ffffff", width=1),
+                        },
+                        {
+                            "pos": (t_p2_ms, float(norm_wave[p2_idx])),
+                            "brush": pg.mkBrush("#ffab00"),
+                            "pen": pg.mkPen("#ffffff", width=1),
+                        },
+                        {
+                            "pos": (t_p3_ms, float(norm_wave[p3_idx])),
+                            "brush": pg.mkBrush("#ff1744"),
+                            "pen": pg.mkPen("#ffffff", width=1),
+                        },
+                    ]
+                    self.osc_impulse_markers.setData(spots)
+
+            # Bottom-Right Real-Time Audio Waveform: scrolling 600 ms window
+            wave_src = (
+                telemetry.filtered_signal
+                if len(telemetry.filtered_signal) > 0
+                else telemetry.envelope
+            )
+            if len(wave_src) > 0:
+                t_wav_ms, y_wav = DSPStreamWorker._extract_waveform_window(
+                    wave_src,
+                    effective_fs=fs,
+                    step_idx=len(self._rate_history),
+                    window_ms=DSPStreamWorker.WAVEFORM_WINDOW_MS,
+                )
+                if len(t_wav_ms) > 0:
+                    self.audio_waveform_curve.setData(t_wav_ms, y_wav)
+
+        if self._capture_start_monotonic is not None and elapsed_s >= stab_s + duration_s:
+            self.stop_capture()
+
+    def _on_waveform_ready(self, time_axis: np.ndarray, waveform: np.ndarray) -> None:
+        """Slot updating the real-time acoustic waveform curve from DSPStreamWorker."""
+        if time_axis is not None and waveform is not None and len(time_axis) > 0:
+            self.audio_waveform_curve.setData(time_axis, waveform)
+
+    def _on_drift_updated(
+        self,
+        effective_fs: float,
+        drift_ppm: float,
+        rate_bias_spd: float,
+    ) -> None:
+        """Slot updating clock drift telemetry in the statistics panel and status bar."""
+        self._last_effective_fs = float(effective_fs)
+        self._last_drift_ppm = float(drift_ppm)
+        self._last_rate_bias_spd = float(rate_bias_spd)
+
+        self.lbl_stat_drift_val.setText(f"{drift_ppm:+.2f} ppm ({effective_fs:.1f} Hz)")
+        self.lbl_drift_status.setText(
+            self.translator.tr("status_drift_format").format(
+                ppm=drift_ppm,
+                fs=effective_fs,
+                bias=rate_bias_spd,
+            )
+        )
+        logger.debug(
+            "Clock drift telemetry updated: effective_fs=%.2f Hz, drift=%+.3f ppm, bias=%+.3f s/d",
+            effective_fs,
+            drift_ppm,
+            rate_bias_spd,
+        )
+
+    def _on_worker_error(self, message: str) -> None:
+        """Slot logging any error emitted by DSPStreamWorker safely on the UI thread."""
+        logger.error("DSPStreamWorker reported error: %s", message)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         """Ensure background worker thread is cleanly stopped before window closes."""
-        logger.info("MainWin closing; stopping active worker if running")
+        logger.info("MainWin closing; stopping active worker and QThread if running")
         self.stop_capture()
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            self.dsp_worker.shutdown()
+        if hasattr(self, "dsp_thread") and self.dsp_thread is not None:
+            if self.dsp_thread.isRunning():
+                self.dsp_thread.quit()
+                self.dsp_thread.wait(3000)
         super().closeEvent(event)
