@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 from numpy.typing import NDArray
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
-from wea.core.clock_drift import SampleRateDriftEstimator
+from wea.core.clock_drift import AtomicNTPDiscipline, SampleRateDriftEstimator
 from wea.core.dsp_engine import DSPEngine
 from wea.core.models import BeatTelemetry, WatchConfig
 from wea.core.ring_buffer import AudioRingBuffer
 from wea.core.synthetic import SyntheticEscapeGenerator
+from wea.utils.audio_io import HardwareAudioCapture
 from wea.utils.logger_setup import LoggerSetup
 
 logger = LoggerSetup.setup_logger(__name__)
@@ -35,16 +38,20 @@ class DSPStreamWorker(QObject):
 
     _sig_start_timer = pyqtSignal(int)
     _sig_stop_timer = pyqtSignal()
+    _sig_start_ntp_timer = pyqtSignal(int)
+    _sig_stop_ntp_timer = pyqtSignal()
 
     DEFAULT_BUFFER_DURATION_S: float = 8.0
     DEFAULT_WINDOW_DURATION_S: float = 4.0
     DEFAULT_CHUNK_SIZE: int = 4096
     WAVEFORM_WINDOW_MS: float = 600.0
+    NTP_DISCIPLINE_INTERVAL_MS: int = 30000
 
     def __init__(
         self,
         config: WatchConfig | None = None,
         *,
+        device_id: int | None = None,
         buffer_duration_s: float = DEFAULT_BUFFER_DURATION_S,
         window_duration_s: float = DEFAULT_WINDOW_DURATION_S,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -61,6 +68,7 @@ class DSPStreamWorker(QObject):
 
         Args:
             config: Watch movement configuration (BPH, lift angle, sample rate).
+            device_id: Hardware input device index, or ``None`` for the synthetic generator.
             buffer_duration_s: Ring buffer capacity in seconds (default 8.0s).
             window_duration_s: Sliding DSP analysis window in seconds (default 4.0s).
             chunk_size: Number of audio samples per streaming chunk (default 4096).
@@ -76,12 +84,13 @@ class DSPStreamWorker(QObject):
         super().__init__(parent)
 
         self.config: WatchConfig = config if config is not None else WatchConfig()
+        self.device_id: int | None = self._normalize_device_id(device_id)
         self.buffer_duration_s: float = max(2.0, float(buffer_duration_s))
         self.window_duration_s: float = max(
             1.0, min(float(window_duration_s), self.buffer_duration_s)
         )
         self.chunk_size: int = max(256, int(chunk_size))
-        self.synthetic_mode: bool = bool(synthetic_mode)
+        self.synthetic_mode: bool = bool(synthetic_mode) if self.device_id is None else False
 
         self.synthetic_rate_spd: float = float(synthetic_rate_spd)
         self.synthetic_beat_error_ms: float = float(synthetic_beat_error_ms)
@@ -94,11 +103,14 @@ class DSPStreamWorker(QObject):
             nominal_fs=float(self.config.sample_rate),
             calibration_ppm=float(calibration_ppm),
         )
+        self.ntp_discipline = AtomicNTPDiscipline()
         self.dsp_engine = DSPEngine(
             config=self.config,
             workers=workers,
             drift_estimator=self.drift_estimator,
         )
+        self._hardware_capture: HardwareAudioCapture | None = None
+        self._ntp_busy: bool = False
 
         self._window_samples: int = 0
         self._min_analysis_samples: int = 0
@@ -121,14 +133,20 @@ class DSPStreamWorker(QObject):
         self._sig_start_timer.connect(self._timer.start)
         self._sig_stop_timer.connect(self._timer.stop)
 
+        self._ntp_timer = QTimer(self)
+        self._ntp_timer.timeout.connect(self.trigger_ntp_discipline_update)
+        self._sig_start_ntp_timer.connect(self._ntp_timer.start)
+        self._sig_stop_ntp_timer.connect(self._ntp_timer.stop)
+
         logger.info(
             "DSPStreamWorker initialized (bph=%d, lift=%.1f deg, fs=%d Hz, "
-            "capacity=%d samples, chunk_size=%d, synthetic_mode=%s)",
+            "capacity=%d samples, chunk_size=%d, device_id=%s, synthetic_mode=%s)",
             self.config.bph,
             self.config.lift_angle,
             self.config.sample_rate,
             self.ring_buffer.capacity_samples,
             self.chunk_size,
+            self.device_id,
             self.synthetic_mode,
         )
 
@@ -268,16 +286,79 @@ class DSPStreamWorker(QObject):
         self._synth_cursor += num_samples
         return chunk
 
+    @staticmethod
+    def _normalize_device_id(device_id: object) -> int | None:
+        """Normalize UI or caller device_id into ``int | None`` (``None`` for synthetic)."""
+        if device_id is None or device_id == "synthetic" or device_id == "":
+            return None
+        if isinstance(device_id, bool):
+            return None
+        try:
+            parsed = int(device_id)  # type: ignore[arg-type]
+            return parsed if parsed >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _stop_hardware_capture(self) -> None:
+        """Stop and release any active HardwareAudioCapture stream."""
+        cap = self._hardware_capture
+        self._hardware_capture = None
+        if cap is not None:
+            cap.stop()
+
+    @pyqtSlot(object)
+    def set_input_device(self, device_id: int | None) -> None:
+        """Switch between SyntheticEscapeGenerator (``None``) and HardwareAudioCapture (``int``)."""
+        norm_id = self._normalize_device_id(device_id)
+        changed = norm_id != self.device_id
+        self.device_id = norm_id
+        self.synthetic_mode = norm_id is None
+        logger.info(
+            "DSPStreamWorker input device set to device_id=%s (synthetic_mode=%s)",
+            self.device_id,
+            self.synthetic_mode,
+        )
+        if self._running and changed:
+            self.stop_stream()
+            self.start_stream()
+
+    @pyqtSlot()
+    def trigger_ntp_discipline_update(self) -> None:
+        """Trigger a non-blocking background AtomicNTPDiscipline skew update."""
+        if self._ntp_busy:
+            return
+        self._ntp_busy = True
+
+        def _worker_fn() -> None:
+            try:
+                skew_ppm = self.ntp_discipline.update_cpu_skew()
+                self.set_cpu_skew_ppm(skew_ppm)
+            except Exception as exc:
+                logger.debug("Background AtomicNTPDiscipline check skipped: %s", exc)
+            finally:
+                self._ntp_busy = False
+
+        threading.Thread(
+            target=_worker_fn,
+            name="WEA-AtomicNTPDiscipline",
+            daemon=True,
+        ).start()
+
     @pyqtSlot()
     def start_stream(self) -> None:
-        """Start streaming analysis (activating the synthetic chunk timer if in synthetic mode)."""
+        """Start streaming analysis (synthetic timer or hardware PortAudio capture)."""
         logger.info(
-            "DSPStreamWorker starting stream (synthetic_mode=%s, bph=%d, lift=%.1f, fs=%d)",
+            "DSPStreamWorker starting stream (device_id=%s, synthetic_mode=%s, bph=%d, lift=%.1f, fs=%d)",
+            self.device_id,
             self.synthetic_mode,
             self.config.bph,
             self.config.lift_angle,
             self.config.sample_rate,
         )
+        self._stop_hardware_capture()
+        self._sig_stop_timer.emit()
+        self._sig_stop_ntp_timer.emit()
+
         self._running = True
         self._receiving_external_chunks = False
         self._samples_since_last_analysis = 0
@@ -287,16 +368,39 @@ class DSPStreamWorker(QObject):
         self.dsp_engine.reset_filter_state()
         self._reset_synthetic_state()
 
-        if self.synthetic_mode:
+        if self.device_id is not None:
+            try:
+                self._hardware_capture = HardwareAudioCapture(
+                    device_id=self.device_id,
+                    sample_rate=float(self.config.sample_rate),
+                    blocksize=self.chunk_size,
+                    callback=self.push_audio_chunk,
+                )
+                self._hardware_capture.start()
+                self._sig_start_ntp_timer.emit(self.NTP_DISCIPLINE_INTERVAL_MS)
+            except Exception as exc:
+                msg = (
+                    f"Failed to open hardware audio device {self.device_id} "
+                    f"at {self.config.sample_rate} Hz: {exc}"
+                )
+                logger.error(msg)
+                self._stop_hardware_capture()
+                self._running = False
+                self.error_occurred.emit(msg)
+                self.session_finished.emit()
+                return
+        elif self.synthetic_mode:
             interval_ms = self._timer_interval_ms()
             self._sig_start_timer.emit(interval_ms)
 
     @pyqtSlot()
     def stop_stream(self) -> None:
-        """Stop the active stream and halt the synthetic simulation timer."""
+        """Stop the active stream and halt synthetic timer or hardware capture."""
         was_running = self._running
         self._running = False
         self._sig_stop_timer.emit()
+        self._sig_stop_ntp_timer.emit()
+        self._stop_hardware_capture()
         logger.info("DSPStreamWorker stream stopped")
         if was_running:
             self.session_finished.emit()
@@ -330,9 +434,32 @@ class DSPStreamWorker(QObject):
             self._samples_since_last_analysis = 0
             self._reset_synthetic_state()
 
-            if self._running and self.synthetic_mode and not self._receiving_external_chunks:
-                self.ring_buffer.clear()
-                self._sig_start_timer.emit(self._timer_interval_ms())
+            if self._running:
+                if self.device_id is not None and fs_changed:
+                    self._stop_hardware_capture()
+                    self.ring_buffer.clear()
+                    try:
+                        self._hardware_capture = HardwareAudioCapture(
+                            device_id=self.device_id,
+                            sample_rate=float(config.sample_rate),
+                            blocksize=self.chunk_size,
+                            callback=self.push_audio_chunk,
+                        )
+                        self._hardware_capture.start()
+                    except Exception as exc:
+                        msg = (
+                            f"Failed to reopen hardware audio device {self.device_id} "
+                            f"at {config.sample_rate} Hz: {exc}"
+                        )
+                        logger.error(msg)
+                        self._stop_hardware_capture()
+                        self._running = False
+                        self.error_occurred.emit(msg)
+                        self.session_finished.emit()
+                        return
+                elif self.synthetic_mode and not self._receiving_external_chunks:
+                    self.ring_buffer.clear()
+                    self._sig_start_timer.emit(self._timer_interval_ms())
 
             logger.info(
                 "DSPStreamWorker updated WatchConfig (bph=%d, lift=%.1f deg, fs=%d Hz)",

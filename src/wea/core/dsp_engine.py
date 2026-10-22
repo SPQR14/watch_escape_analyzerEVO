@@ -40,6 +40,12 @@ class DSPEngine:
     MIN_AMPLITUDE_DEG: float = 100.0
     MAX_AMPLITUDE_DEG: float = 340.0
     CARRIER_PEAK_ALIGNMENT_SEC: float = 17.5e-6
+    SHOCK_MAD_MULTIPLIER: float = 12.0
+    SHOCK_MIN_DURATION_MS: float = 8.0
+    AGC_TARGET_PEAK: float = 1.0
+    AGC_NOISE_GATE_FLOOR: float = 1e-5
+    AGC_MIN_GAIN: float = 0.05
+    AGC_MAX_GAIN: float = 500.0
 
     def __init__(
         self,
@@ -90,6 +96,7 @@ class DSPEngine:
             self.filter_order,
         )
         self._sos_zi: NDArray[np.float64] | None = None
+        self._agc_env_level: float | None = None
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=self.workers)
 
         logger.info(
@@ -117,9 +124,10 @@ class DSPEngine:
             self._executor = None
 
     def reset_filter_state(self) -> None:
-        """Reset the stateful streaming SOS filter state ``zi``."""
+        """Reset the stateful streaming SOS filter state ``zi`` and AGC tracker state."""
         self._sos_zi = None
-        logger.debug("DSPEngine streaming SOS filter state reset")
+        self._agc_env_level = None
+        logger.debug("DSPEngine streaming SOS filter and AGC state reset")
 
     @staticmethod
     def _design_highpass_sos(
@@ -173,6 +181,233 @@ class DSPEngine:
             return np.asarray(filtered, dtype=np.float64)
 
         return np.asarray(sosfiltfilt(sos, sig), dtype=np.float64)
+
+    @staticmethod
+    def _estimate_clean_beat_peak(envelope: NDArray[np.float64], fs_eff: float) -> float:
+        """Estimate the normal escapement beat peak level using median of 220 ms block maxima.
+
+        Because any horological movement (>= 18,000 BPH, beat period <= 200 ms) produces at
+        least one beat per 220 ms block, the median across block maxima is immune to isolated
+        mechanical shock transients.
+        """
+        n = len(envelope)
+        if n == 0:
+            return 0.0
+        block_len = max(16, int(round(0.220 * fs_eff)))
+        if n < block_len * 2:
+            return float(np.percentile(envelope, 98.0))
+        n_blocks = n // block_len
+        reshaped = envelope[: n_blocks * block_len].reshape(n_blocks, block_len)
+        block_maxima = np.max(reshaped, axis=1)
+        return float(np.median(block_maxima))
+
+    @staticmethod
+    def _find_contiguous_runs(mask: NDArray[np.bool_]) -> list[tuple[int, int]]:
+        """Return ``(start_idx, end_idx)`` half-open intervals for contiguous True regions."""
+        if len(mask) == 0 or not np.any(mask):
+            return []
+        padded = np.empty(len(mask) + 2, dtype=np.int8)
+        padded[0] = 0
+        padded[1:-1] = mask.view(np.int8)
+        padded[-1] = 0
+        diffs = np.diff(padded)
+        starts = np.where(diffs == 1)[0]
+        ends = np.where(diffs == -1)[0]
+        return [(int(s), int(e)) for s, e in zip(starts, ends)]
+
+    def blank_transients(
+        self,
+        filtered_signal: NDArray[np.float64],
+        fs: float | None = None,
+        raw_signal: NDArray[np.float64] | None = None,
+        mad_multiplier: float = SHOCK_MAD_MULTIPLIER,
+        min_duration_ms: float = SHOCK_MIN_DURATION_MS,
+    ) -> tuple[NDArray[np.float64], NDArray[np.bool_], float]:
+        """Detect and blank non-horological mechanical shocks and rotor transients.
+
+        Identifies transient energy bursts exceeding ``mad_multiplier`` (default 12x) the
+        robust median absolute deviation (MAD) over a contiguous duration exceeding
+        ``min_duration_ms`` (default 8.0 ms), as well as extreme overload spikes (> 3x the
+        median per-block beat peak), and mutes those segments with a smooth cosine edge
+        taper.
+
+        Args:
+            filtered_signal: 1D high-pass filtered audio signal.
+            fs: Optional effective sampling rate in Hz.
+            raw_signal: Optional unfiltered audio buffer to also catch low-frequency shocks.
+            mad_multiplier: MAD threshold multiplier for shock detection (default 12.0).
+            min_duration_ms: Minimum sustained duration in milliseconds (default 8.0 ms).
+
+        Returns:
+            Tuple of ``(conditioned_signal, blank_mask, blanked_fraction)``.
+        """
+        sig = np.asarray(filtered_signal, dtype=np.float64).ravel()
+        n = len(sig)
+        if n == 0:
+            return sig.copy(), np.zeros(0, dtype=np.bool_), 0.0
+
+        fs_eff = float(fs) if fs is not None else self._resolve_effective_fs()
+        short_win = max(3, int(round(0.0025 * fs_eff)))
+        short_kernel = np.ones(short_win, dtype=np.float64) / float(short_win)
+        short_env = np.convolve(np.abs(sig), short_kernel, mode="same")
+
+        med = float(np.median(short_env))
+        mad = float(np.median(np.abs(short_env - med))) + 1e-12
+        clean_peak = self._estimate_clean_beat_peak(short_env, fs_eff)
+
+        min_shock_samples = max(2, int(round((min_duration_ms / 1000.0) * fs_eff)))
+        sustained_thresh = max(med + mad_multiplier * mad, 0.35 * clean_peak)
+        overload_thresh = max(med + 2.0 * mad_multiplier * mad, 3.0 * max(clean_peak, 1e-9))
+
+        blank_mask = np.zeros(n, dtype=np.bool_)
+
+        # 1. Sustained non-horological bursts (> 12x MAD for > 8 ms)
+        for s_idx, e_idx in self._find_contiguous_runs(short_env > sustained_thresh):
+            if (e_idx - s_idx) >= min_shock_samples:
+                blank_mask[s_idx:e_idx] = True
+
+        # 2. Extreme overload spikes (> 3x normal beat peak & > 24x MAD)
+        if clean_peak > 0.0:
+            overload_hits = short_env > overload_thresh
+            if np.any(overload_hits):
+                blank_mask |= overload_hits
+
+        # 3. Check raw unfiltered signal if provided (catches low-frequency/DC step bumps > 8 ms)
+        if raw_signal is not None:
+            raw_arr = np.asarray(raw_signal, dtype=np.float64).ravel()
+            if len(raw_arr) == n:
+                raw_dev = np.abs(raw_arr - float(np.median(raw_arr)))
+                raw_env = np.convolve(raw_dev, short_kernel, mode="same")
+                raw_med = float(np.median(raw_env))
+                raw_mad = float(np.median(np.abs(raw_env - raw_med))) + 1e-12
+                raw_clean_peak = self._estimate_clean_beat_peak(raw_env, fs_eff)
+                raw_thresh = max(raw_med + mad_multiplier * raw_mad, 2.5 * raw_clean_peak)
+                for s_idx, e_idx in self._find_contiguous_runs(raw_env > raw_thresh):
+                    if (e_idx - s_idx) >= min_shock_samples:
+                        blank_mask[s_idx:e_idx] = True
+
+        if not np.any(blank_mask):
+            return sig.copy(), blank_mask, 0.0
+
+        # Expand blanked intervals by a 6 ms guard margin to suppress IIR filter edge ringing
+        guard_samples = max(4, int(round(0.006 * fs_eff)))
+        expanded_mask = np.zeros(n, dtype=np.bool_)
+        for s_idx, e_idx in self._find_contiguous_runs(blank_mask):
+            g0 = max(0, s_idx - guard_samples)
+            g1 = min(n, e_idx + guard_samples)
+            expanded_mask[g0:g1] = True
+
+        conditioned = sig.copy()
+        conditioned[expanded_mask] = 0.0
+
+        # Smooth 1 ms raised-cosine taper immediately outside blanked regions
+        taper_len = max(4, int(round(0.001 * fs_eff)))
+        for s_idx, e_idx in self._find_contiguous_runs(expanded_mask):
+            left_start = max(0, s_idx - taper_len)
+            if s_idx > left_start:
+                w_left = 0.5 * (
+                    1.0 + np.cos(np.linspace(0.0, np.pi, s_idx - left_start, dtype=np.float64))
+                )
+                conditioned[left_start:s_idx] *= w_left
+            right_end = min(n, e_idx + taper_len)
+            if right_end > e_idx:
+                w_right = 0.5 * (
+                    1.0 - np.cos(np.linspace(0.0, np.pi, right_end - e_idx, dtype=np.float64))
+                )
+                conditioned[e_idx:right_end] *= w_right
+
+        blanked_fraction = float(np.mean(expanded_mask))
+        logger.info(
+            "Transient shock blanking suppressed %.2f%% of window (%d/%d samples)",
+            blanked_fraction * 100.0,
+            int(np.sum(expanded_mask)),
+            n,
+        )
+        return conditioned, expanded_mask, blanked_fraction
+
+    def apply_agc(
+        self,
+        signal: NDArray[np.float64],
+        fs: float | None = None,
+        streaming: bool = False,
+        target_peak: float = AGC_TARGET_PEAK,
+        noise_gate_floor: float = AGC_NOISE_GATE_FLOOR,
+    ) -> NDArray[np.float64]:
+        """Apply fast-attack / slow-release Adaptive Gain Control (AGC) with noise-gate floor.
+
+        Tracks the peak envelope over 10 ms sub-blocks using fast attack (to prevent
+        clipping on loud vintage movements) and slow release (to boost quiet titanium/diver
+        cases without distorting intra-beat P1/P2/P3 relative amplitudes). Holds unity gain
+        when the signal lies below ``noise_gate_floor`` or lacks impulsive beats above the
+        ambient noise floor.
+
+        Args:
+            signal: 1D conditioned audio array.
+            fs: Optional effective sampling rate in Hz.
+            streaming: Whether to persist envelope tracker state across calls.
+            target_peak: Target normalized peak amplitude (default 1.0).
+            noise_gate_floor: Minimum peak amplitude required to engage AGC boost.
+
+        Returns:
+            Gain-normalized 1D float64 signal array.
+        """
+        sig = np.asarray(signal, dtype=np.float64).ravel()
+        n = len(sig)
+        if n == 0:
+            return sig.copy()
+
+        fs_eff = float(fs) if fs is not None else self._resolve_effective_fs()
+        abs_sig = np.abs(sig)
+        clean_peak = self._estimate_clean_beat_peak(abs_sig, fs_eff)
+
+        med = float(np.median(abs_sig))
+        mad = float(np.median(np.abs(abs_sig - med))) + 1e-12
+        robust_sigma = 1.4826 * mad
+
+        # Noise gate: do not amplify pure silence or stationary noise when no watch is present
+        if clean_peak < noise_gate_floor or (
+            robust_sigma > 1e-9 and clean_peak < med + 4.5 * robust_sigma
+        ):
+            return sig.copy()
+
+        sub_len = max(16, int(round(0.010 * fs_eff)))
+        n_blocks = max(1, (n + sub_len - 1) // sub_len)
+
+        env_level = (
+            self._agc_env_level
+            if (streaming and self._agc_env_level is not None and self._agc_env_level > 0.0)
+            else clean_peak
+        )
+
+        alpha_attack = 0.35
+        alpha_release = 0.004
+        min_hold_level = max(noise_gate_floor, 0.85 * clean_peak)
+
+        block_gains = np.empty(n_blocks, dtype=np.float64)
+        block_centers = np.empty(n_blocks, dtype=np.float64)
+
+        for b_idx in range(n_blocks):
+            b0 = b_idx * sub_len
+            b1 = min(n, b0 + sub_len)
+            block_peak = float(np.max(abs_sig[b0:b1])) if b1 > b0 else 0.0
+            if block_peak > env_level:
+                env_level = alpha_attack * block_peak + (1.0 - alpha_attack) * env_level
+            else:
+                env_level = max(min_hold_level, (1.0 - alpha_release) * env_level)
+
+            gain = target_peak / max(env_level, noise_gate_floor)
+            block_gains[b_idx] = float(np.clip(gain, self.AGC_MIN_GAIN, self.AGC_MAX_GAIN))
+            block_centers[b_idx] = 0.5 * float(b0 + b1 - 1)
+
+        if streaming:
+            self._agc_env_level = float(env_level)
+
+        if n_blocks == 1:
+            return sig * block_gains[0]
+
+        sample_idx = np.arange(n, dtype=np.float64)
+        smooth_gain = np.interp(sample_idx, block_centers, block_gains)
+        return np.asarray(sig * smooth_gain, dtype=np.float64)
 
     def compute_envelopes(
         self,
@@ -380,10 +615,16 @@ class DSPEngine:
         fs_eff = self._resolve_effective_fs(effective_fs)
 
         filtered = self.filter_signal(audio_buffer, streaming=streaming, fs=fs_eff)
-        macro_env, micro_env = self.compute_envelopes(filtered, fs=fs_eff)
+        conditioned, blank_mask, blank_fraction = self.blank_transients(
+            filtered,
+            fs=fs_eff,
+            raw_signal=audio_buffer,
+        )
+        normalized = self.apply_agc(conditioned, fs=fs_eff, streaming=streaming)
+        macro_env, micro_env = self.compute_envelopes(normalized, fs=fs_eff)
 
         peak_indices = self.detect_macro_beat_peaks(macro_env, bph=active_bph, fs_eff=fs_eff)
-        n_samples = len(filtered)
+        n_samples = len(normalized)
         pre_samples = int(round(0.012 * fs_eff))
         post_samples = int(round(0.004 * fs_eff))
 
@@ -391,7 +632,9 @@ class DSPEngine:
         for pk_idx in peak_indices:
             s0 = max(0, pk_idx - pre_samples)
             s1 = min(n_samples, pk_idx + post_samples)
-            tasks.append((micro_env[s0:s1], filtered[s0:s1], s0, fs_eff))
+            if len(blank_mask) == n_samples and np.any(blank_mask[s0:s1]):
+                continue
+            tasks.append((micro_env[s0:s1], normalized[s0:s1], s0, fs_eff))
 
         if tasks:
             if self._executor is not None and self.workers > 1 and len(tasks) > 1:
@@ -417,7 +660,7 @@ class DSPEngine:
                 snr_db=0.0,
                 beats=beats,
                 micro_envelope=micro_env,
-                filtered_signal=filtered,
+                filtered_signal=normalized,
                 effective_fs=fs_eff,
             )
 
@@ -426,23 +669,39 @@ class DSPEngine:
         beat_times = 0.35 * p1_times + 0.65 * p3_times
 
         t0 = 3600.0 / float(active_bph)
+        beat_indices = self._assign_beat_indices(beat_times, t0)
 
-        # Full oscillations T_{osc, i} = t_{i+2} - t_i cancel asymmetric tick/tock beat error
+        # Full oscillations cancel asymmetric tick/tock beat error even across blanked beat gaps
         t_osc = beat_times[2:] - beat_times[:-2]
-        mean_t_osc = self._estimate_oscillation_period(beat_times, t_osc, 2.0 * t0)
+        mean_t_osc = self._estimate_oscillation_period(
+            beat_times,
+            t_osc,
+            2.0 * t0,
+            beat_indices=beat_indices,
+        )
 
         # Rate (s/d): 86400 * ((2 * T0 - T_osc_bar) / (2 * T0))
         rate_spd = self.SECONDS_PER_DAY * ((2.0 * t0 - mean_t_osc) / (2.0 * t0))
 
-        # Beat Error (ms) from alternating tick->tock and tock->tick half-periods.
-        # Note: SyntheticEscapeGenerator shifts alternating intervals by ±0.5 * BE, so
-        # |T_tick_to_tock - T_tock_to_tick| equals the full beat error in seconds.
+        # Beat Error (ms) from alternating tick->tock and tock->tick single-beat half-periods,
+        # preserving true tick/tock parity via beat_indices even when a beat is blanked by a shock.
         half_periods = np.diff(beat_times)
-        even_intervals = half_periods[0::2]
-        odd_intervals = half_periods[1::2]
-        mean_even = self._trimmed_mean(even_intervals)
-        mean_odd = self._trimmed_mean(odd_intervals)
-        beat_error_ms = abs(mean_even - mean_odd) * 1000.0
+        index_steps = np.diff(beat_indices)
+        single_step_mask = (index_steps == 1) & (np.abs(half_periods - t0) < 0.25 * t0)
+        if np.any(single_step_mask):
+            start_parities = beat_indices[:-1] % 2
+            even_intervals = half_periods[single_step_mask & (start_parities == 0)]
+            odd_intervals = half_periods[single_step_mask & (start_parities == 1)]
+        else:
+            even_intervals = half_periods[0::2]
+            odd_intervals = half_periods[1::2]
+
+        if len(even_intervals) > 0 and len(odd_intervals) > 0:
+            mean_even = self._trimmed_mean(even_intervals)
+            mean_odd = self._trimmed_mean(odd_intervals)
+            beat_error_ms = abs(mean_even - mean_odd) * 1000.0
+        else:
+            beat_error_ms = 0.0
 
         # Amplitude (deg) from pallet lift duration between unlocking (t1) and drop (t3)
         dt_p1_p3 = (p3_times - p1_times) + self.CARRIER_PEAK_ALIGNMENT_SEC
@@ -473,7 +732,12 @@ class DSPEngine:
             else 0.0
         )
         jitter = 0.5 * (even_jitter + odd_jitter)
-        confidence = float(np.clip(np.exp(-jitter / 0.0005), 0.0, 1.0))
+        base_confidence = float(np.clip(np.exp(-jitter / 0.0005), 0.0, 1.0))
+        if blank_fraction > 0.0:
+            shock_penalty = float(np.clip(1.0 - max(0.08, 2.5 * blank_fraction), 0.10, 0.92))
+            confidence = base_confidence * shock_penalty
+        else:
+            confidence = base_confidence
 
         # Acoustic SNR (dB): ratio of peak beat envelope amplitude to median noise floor
         peak_env = float(np.median([np.sqrt(max(b.peak_energy, 0.0)) for b in beats]))
@@ -492,7 +756,7 @@ class DSPEngine:
             snr_db=snr_db,
             beats=beats,
             micro_envelope=micro_env,
-            filtered_signal=filtered,
+            filtered_signal=normalized,
             effective_fs=fs_eff,
         )
         logger.debug(
@@ -510,31 +774,103 @@ class DSPEngine:
     analyze = process_window
     process = process_window
 
+    @staticmethod
+    def _assign_beat_indices(
+        beat_times: NDArray[np.float64], nominal_beat_period: float
+    ) -> NDArray[np.int64]:
+        """Assign integer beat indices m_i accounting for any beats skipped during shock blanking."""
+        n = len(beat_times)
+        if n == 0:
+            return np.empty(0, dtype=np.int64)
+        if n == 1:
+            return np.zeros(1, dtype=np.int64)
+
+        diffs = np.diff(beat_times)
+        single_candidates = diffs[
+            (diffs > 0.65 * nominal_beat_period) & (diffs < 1.35 * nominal_beat_period)
+        ]
+        ref_period = (
+            float(np.median(single_candidates))
+            if len(single_candidates) >= 2
+            else float(nominal_beat_period)
+        )
+        steps = np.maximum(1, np.rint(diffs / ref_period).astype(np.int64))
+        indices = np.empty(n, dtype=np.int64)
+        indices[0] = 0
+        indices[1:] = np.cumsum(steps)
+        return indices
+
     @classmethod
     def _estimate_oscillation_period(
         cls,
         beat_times: NDArray[np.float64],
         t_osc: NDArray[np.float64],
         nominal_osc_period: float,
+        beat_indices: NDArray[np.int64] | None = None,
     ) -> float:
         """Compute robust oscillation period using OLS slope across even/odd oscillation tracks."""
         if len(t_osc) == 0:
             return nominal_osc_period
 
+        if beat_indices is None or len(beat_indices) != len(beat_times):
+            beat_indices = cls._assign_beat_indices(beat_times, 0.5 * nominal_osc_period)
+
+        even_mask = (beat_indices % 2) == 0
+        odd_mask = ~even_mask
+
+        even_times = beat_times[even_mask]
+        even_k = (beat_indices[even_mask] // 2).astype(np.float64)
+        odd_times = beat_times[odd_mask]
+        odd_k = ((beat_indices[odd_mask] - 1) // 2).astype(np.float64)
+
+        norm_osc_list: list[NDArray[np.float64]] = []
+        if len(even_times) >= 2:
+            dk_even = np.diff(even_k)
+            valid_e = dk_even > 0
+            if np.any(valid_e):
+                norm_osc_list.append(np.diff(even_times)[valid_e] / dk_even[valid_e])
+        if len(odd_times) >= 2:
+            dk_odd = np.diff(odd_k)
+            valid_o = dk_odd > 0
+            if np.any(valid_o):
+                norm_osc_list.append(np.diff(odd_times)[valid_o] / dk_odd[valid_o])
+
+        if norm_osc_list:
+            norm_osc = np.concatenate(norm_osc_list)
+            med_osc = float(np.median(norm_osc))
+            mad_osc = float(np.median(np.abs(norm_osc - med_osc))) + 1e-12
+            inliers = np.abs(norm_osc - med_osc) <= max(
+                4.0 * 1.4826 * mad_osc, 0.002 * nominal_osc_period
+            )
+            if np.all(inliers) and len(beat_times) >= 6:
+                slope_even = cls._ols_slope_with_indices(even_k, even_times)
+                slope_odd = cls._ols_slope_with_indices(odd_k, odd_times)
+                if slope_even > 0.0 and slope_odd > 0.0:
+                    return 0.5 * (slope_even + slope_odd)
+            valid_osc = norm_osc[inliers] if np.any(inliers) else norm_osc
+            return cls._trimmed_mean(valid_osc)
+
         med_osc = float(np.median(t_osc))
         mad_osc = float(np.median(np.abs(t_osc - med_osc))) + 1e-12
         inliers = np.abs(t_osc - med_osc) <= max(4.0 * 1.4826 * mad_osc, 0.002 * nominal_osc_period)
-
-        if np.all(inliers) and len(beat_times) >= 6:
-            even_beats = beat_times[0::2]
-            odd_beats = beat_times[1::2]
-            slope_even = cls._centered_ols_slope(even_beats)
-            slope_odd = cls._centered_ols_slope(odd_beats)
-            if slope_even > 0.0 and slope_odd > 0.0:
-                return 0.5 * (slope_even + slope_odd)
-
         valid_osc = t_osc[inliers] if np.any(inliers) else t_osc
         return cls._trimmed_mean(valid_osc)
+
+    @staticmethod
+    def _ols_slope_with_indices(
+        indices: NDArray[np.float64],
+        times: NDArray[np.float64],
+    ) -> float:
+        """Compute centered OLS slope of timestamps against explicit oscillation indices k."""
+        n = len(times)
+        if n < 2 or len(indices) != n:
+            return 0.0
+        k_c = indices - np.mean(indices)
+        t_c = times - np.mean(times)
+        denom = float(np.dot(k_c, k_c))
+        if denom <= 1e-18:
+            return 0.0
+        return float(np.dot(k_c, t_c) / denom)
 
     @staticmethod
     def _centered_ols_slope(times: NDArray[np.float64]) -> float:

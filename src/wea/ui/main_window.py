@@ -50,7 +50,9 @@ from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.i18n.translator import Translator
 from wea.ui.dsp_worker import DSPStreamWorker
 from wea.utils.audio_io import (
+    AudioDeviceInfo,
     is_flac_supported,
+    list_input_devices,
     save_audio_recording,
 )
 from wea.utils.logger_setup import LoggerSetup
@@ -376,6 +378,7 @@ class MainWin(QMainWindow):
         self.cmb_bph.currentTextChanged.connect(self._on_watch_config_changed)
         self.spn_lift.valueChanged.connect(self._on_watch_config_changed)
         self.cmb_srate.currentIndexChanged.connect(self._on_watch_config_changed)
+        self.cmb_device.currentIndexChanged.connect(self._on_device_changed)
 
         # Timer enforcing automatic test completion at (stabilization_s + duration_s)
         self._session_timer = QTimer(self)
@@ -1285,25 +1288,62 @@ class MainWin(QMainWindow):
         self.lbl_drift_status.setObjectName("StatValue")
         self.statusBar().addPermanentWidget(self.lbl_drift_status)
 
-    def _populate_audio_devices(self) -> None:
-        """Populate input audio device selector with synthetic generator and hardware inputs."""
-        self.cmb_device.clear()
-        self.cmb_device.addItem(self.translator.tr("synthetic_device"), "synthetic")
-        hw_count = 0
-        try:
-            import sounddevice as sd
+    def _populate_audio_devices(self) -> list[AudioDeviceInfo]:
+        """Populate input audio device selector dynamically via ``list_input_devices()``."""
+        prev_data = self.cmb_device.currentData() if self.cmb_device.count() > 0 else None
+        devices = list_input_devices()
 
-            devices = sd.query_devices()
+        was_blocked = self.cmb_device.blockSignals(True)
+        try:
+            self.cmb_device.clear()
+            restore_index = 0
             for idx, dev in enumerate(devices):
-                if isinstance(dev, dict) and dev.get("max_input_channels", 0) > 0:
-                    name = dev.get("name", f"Device {idx}")
-                    self.cmb_device.addItem(f"[{idx}] {name}", idx)
-                    hw_count += 1
-            logger.info(
-                "Initialized audio input devices: 1 synthetic + %d hardware inputs", hw_count
-            )
-        except Exception as exc:
-            logger.warning("Could not query hardware audio devices: %s", exc)
+                if dev.is_synthetic or dev.device_id is None:
+                    self.cmb_device.addItem(self.translator.tr("synthetic_device"), None)
+                else:
+                    label = f"[{dev.device_id}] {dev.name}"
+                    self.cmb_device.addItem(label, int(dev.device_id))
+                    if (
+                        prev_data is not None
+                        and prev_data != "synthetic"
+                        and int(prev_data) == int(dev.device_id)
+                    ):
+                        restore_index = idx
+            self.cmb_device.setCurrentIndex(restore_index)
+        finally:
+            self.cmb_device.blockSignals(was_blocked)
+
+        self._sync_combo_popup_width(self.cmb_device, min_width=230)
+        logger.info(
+            "Populated audio input devices: %d total (1 synthetic + %d hardware)",
+            len(devices),
+            max(0, len(devices) - 1),
+        )
+        return devices
+
+    def refresh_audio_devices(self) -> list[AudioDeviceInfo]:
+        """Re-query available audio input devices and sync selection with DSPStreamWorker."""
+        devices = self._populate_audio_devices()
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            self.dsp_worker.set_input_device(self.selected_device_id())
+        return devices
+
+    def selected_device_id(self) -> int | None:
+        """Return the currently selected hardware ``device_id`` or ``None`` for synthetic mode."""
+        data = self.cmb_device.currentData()
+        if data is None or data == "synthetic" or data == "":
+            return None
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return None
+
+    def _on_device_changed(self, _index: int) -> None:
+        """Handle user changes to the IN Device selector and update DSPStreamWorker."""
+        device_id = self.selected_device_id()
+        logger.info("IN Device selection changed to device_id=%s", device_id)
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            self.dsp_worker.set_input_device(device_id)
 
     def _on_caliber_changed(self, caliber_name: str) -> None:
         """Update BPH and Lift Angle automatically when a caliber preset is selected."""
@@ -1997,6 +2037,7 @@ class MainWin(QMainWindow):
         self.dsp_worker.synthetic_rate_spd = base_rate
         self.dsp_worker.synthetic_beat_error_ms = base_be
         self.dsp_worker.synthetic_amplitude_deg = base_amp
+        self.dsp_worker.set_input_device(self.selected_device_id())
         self.dsp_worker.update_watch_config(config)
         self.dsp_worker.start_stream()
         self._session_timer.start()
