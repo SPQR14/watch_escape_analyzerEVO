@@ -38,12 +38,17 @@ class DSPStreamWorker(QObject):
 
     _sig_start_timer = pyqtSignal(int)
     _sig_stop_timer = pyqtSignal()
+    _sig_start_telemetry_timer = pyqtSignal(int)
+    _sig_stop_telemetry_timer = pyqtSignal()
     _sig_start_ntp_timer = pyqtSignal(int)
     _sig_stop_ntp_timer = pyqtSignal()
+    _sig_schedule_eval = pyqtSignal()
 
     DEFAULT_BUFFER_DURATION_S: float = 8.0
-    DEFAULT_WINDOW_DURATION_S: float = 4.0
+    DEFAULT_WINDOW_DURATION_S: float = 3.0
     DEFAULT_CHUNK_SIZE: int = 4096
+    VISUAL_TIMER_INTERVAL_MS: int = 33
+    TELEMETRY_TIMER_INTERVAL_MS: int = 250
     WAVEFORM_WINDOW_MS: float = 600.0
     NTP_DISCIPLINE_INTERVAL_MS: int = 30000
 
@@ -89,7 +94,7 @@ class DSPStreamWorker(QObject):
         self.window_duration_s: float = max(
             1.0, min(float(window_duration_s), self.buffer_duration_s)
         )
-        self.chunk_size: int = max(256, int(chunk_size))
+        self.chunk_size: int = max(32, int(chunk_size))
         self.synthetic_mode: bool = bool(synthetic_mode) if self.device_id is None else False
 
         self.synthetic_rate_spd: float = float(synthetic_rate_spd)
@@ -117,6 +122,7 @@ class DSPStreamWorker(QObject):
         self._analysis_hop_samples: int = 0
         self._samples_since_last_analysis: int = 0
         self._has_emitted_telemetry: bool = False
+        self._eval_queued: bool = False
         self._recompute_window_thresholds()
 
         self._running: bool = False
@@ -129,14 +135,21 @@ class DSPStreamWorker(QObject):
         self._waveform_step_idx: int = 0
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._on_synthetic_timer_tick)
+        self._timer.timeout.connect(self._on_visual_timer_tick)
         self._sig_start_timer.connect(self._timer.start)
         self._sig_stop_timer.connect(self._timer.stop)
+
+        self._telemetry_timer = QTimer(self)
+        self._telemetry_timer.timeout.connect(self._on_telemetry_timer_tick)
+        self._sig_start_telemetry_timer.connect(self._telemetry_timer.start)
+        self._sig_stop_telemetry_timer.connect(self._telemetry_timer.stop)
 
         self._ntp_timer = QTimer(self)
         self._ntp_timer.timeout.connect(self.trigger_ntp_discipline_update)
         self._sig_start_ntp_timer.connect(self._ntp_timer.start)
         self._sig_stop_ntp_timer.connect(self._ntp_timer.stop)
+
+        self._sig_schedule_eval.connect(self._on_scheduled_eval)
 
         logger.info(
             "DSPStreamWorker initialized (bph=%d, lift=%.1f deg, fs=%d Hz, "
@@ -171,11 +184,11 @@ class DSPStreamWorker(QObject):
             self._window_samples,
             int(round(min_beats_sec * fs)),
         )
-        self._analysis_hop_samples = max(self.chunk_size, int(round(0.25 * fs)))
+        self._analysis_hop_samples = max(1, int(round(0.25 * fs)))
 
     def _timer_interval_ms(self) -> int:
-        """Compute realistic timer interval in milliseconds for ``chunk_size`` at ``sample_rate``."""
-        return max(15, int(round((self.chunk_size / float(self.config.sample_rate)) * 1000.0)))
+        """Return visual timer interval in milliseconds (~30 FPS)."""
+        return self.VISUAL_TIMER_INTERVAL_MS
 
     def _reset_synthetic_state(self) -> None:
         """Reset phase-continuous synthetic generator state."""
@@ -357,12 +370,14 @@ class DSPStreamWorker(QObject):
         )
         self._stop_hardware_capture()
         self._sig_stop_timer.emit()
+        self._sig_stop_telemetry_timer.emit()
         self._sig_stop_ntp_timer.emit()
 
         self._running = True
         self._receiving_external_chunks = False
         self._samples_since_last_analysis = 0
         self._has_emitted_telemetry = False
+        self._eval_queued = False
         self.ring_buffer.clear()
         self.drift_estimator.reset()
         self.dsp_engine.reset_filter_state()
@@ -374,9 +389,11 @@ class DSPStreamWorker(QObject):
                     device_id=self.device_id,
                     sample_rate=float(self.config.sample_rate),
                     blocksize=self.chunk_size,
-                    callback=self.push_audio_chunk,
+                    callback=self._on_hardware_audio_chunk,
                 )
                 self._hardware_capture.start()
+                self._sig_start_timer.emit(self.VISUAL_TIMER_INTERVAL_MS)
+                self._sig_start_telemetry_timer.emit(self.TELEMETRY_TIMER_INTERVAL_MS)
                 self._sig_start_ntp_timer.emit(self.NTP_DISCIPLINE_INTERVAL_MS)
             except Exception as exc:
                 msg = (
@@ -390,15 +407,17 @@ class DSPStreamWorker(QObject):
                 self.session_finished.emit()
                 return
         elif self.synthetic_mode:
-            interval_ms = self._timer_interval_ms()
-            self._sig_start_timer.emit(interval_ms)
+            self._sig_start_timer.emit(self.VISUAL_TIMER_INTERVAL_MS)
+            self._sig_start_telemetry_timer.emit(self.TELEMETRY_TIMER_INTERVAL_MS)
 
     @pyqtSlot()
     def stop_stream(self) -> None:
         """Stop the active stream and halt synthetic timer or hardware capture."""
         was_running = self._running
         self._running = False
+        self._eval_queued = False
         self._sig_stop_timer.emit()
+        self._sig_stop_telemetry_timer.emit()
         self._sig_stop_ntp_timer.emit()
         self._stop_hardware_capture()
         logger.info("DSPStreamWorker stream stopped")
@@ -422,9 +441,10 @@ class DSPStreamWorker(QObject):
                 self.ring_buffer = AudioRingBuffer(capacity_samples=new_capacity)
                 self.drift_estimator.nominal_fs = float(config.sample_rate)
                 self.drift_estimator.reset()
-                self.dsp_engine._sos = self.dsp_engine._design_highpass_sos(
+                self.dsp_engine._sos = self.dsp_engine._design_bandpass_sos(
                     float(config.sample_rate),
                     self.dsp_engine.highpass_cutoff_hz,
+                    self.dsp_engine.lowpass_cutoff_hz,
                     self.dsp_engine.filter_order,
                 )
 
@@ -432,6 +452,7 @@ class DSPStreamWorker(QObject):
             self.dsp_engine.reset_filter_state()
             self._recompute_window_thresholds()
             self._samples_since_last_analysis = 0
+            self._eval_queued = False
             self._reset_synthetic_state()
 
             if self._running:
@@ -443,7 +464,7 @@ class DSPStreamWorker(QObject):
                             device_id=self.device_id,
                             sample_rate=float(config.sample_rate),
                             blocksize=self.chunk_size,
-                            callback=self.push_audio_chunk,
+                            callback=self._on_hardware_audio_chunk,
                         )
                         self._hardware_capture.start()
                     except Exception as exc:
@@ -459,7 +480,8 @@ class DSPStreamWorker(QObject):
                         return
                 elif self.synthetic_mode and not self._receiving_external_chunks:
                     self.ring_buffer.clear()
-                    self._sig_start_timer.emit(self._timer_interval_ms())
+                    self._sig_start_timer.emit(self.VISUAL_TIMER_INTERVAL_MS)
+                    self._sig_start_telemetry_timer.emit(self.TELEMETRY_TIMER_INTERVAL_MS)
 
             logger.info(
                 "DSPStreamWorker updated WatchConfig (bph=%d, lift=%.1f deg, fs=%d Hz)",
@@ -507,27 +529,125 @@ class DSPStreamWorker(QObject):
             logger.error("Failed to set cpu_skew_ppm in DSPStreamWorker: %s", exc, exc_info=True)
             self.error_occurred.emit(str(exc))
 
+    def _on_hardware_audio_chunk(
+        self,
+        chunk: NDArray[np.float64],
+        timestamp_ns: int | None = None,
+    ) -> None:
+        """Non-blocking PortAudio ingestion callback: writes to ring buffer with zero DSP on audio thread."""
+        if chunk is None:
+            return
+        samples = np.asarray(chunk, dtype=np.float64).ravel()
+        n_samples = int(samples.size)
+        if n_samples == 0:
+            return
+
+        self._receiving_external_chunks = True
+        self.ring_buffer.write(samples)
+        self.drift_estimator.update(n_samples, timestamp_ns=timestamp_ns)
+        self._samples_since_last_analysis += n_samples
+
+        if (
+            self.ring_buffer.available_samples >= self._min_analysis_samples
+            and self._samples_since_last_analysis >= self._analysis_hop_samples
+            and not self._eval_queued
+        ):
+            self._eval_queued = True
+            self._sig_schedule_eval.emit()
+
     @pyqtSlot()
-    def _on_synthetic_timer_tick(self) -> None:
-        """Feed a synthetic audio chunk into the DSP pipeline on each timer tick."""
-        if not self._running or not self.synthetic_mode or self._receiving_external_chunks:
+    def _on_scheduled_eval(self) -> None:
+        """Execute scheduled visual and telemetry evaluation on the worker QThread."""
+        self._eval_queued = False
+        self._on_visual_timer_tick()
+        self._on_telemetry_timer_tick()
+
+    @pyqtSlot()
+    def _on_visual_timer_tick(self) -> None:
+        """Fast 30 FPS (33 ms) visual timer: feeds synthetic audio (if active) and emits waveform_ready."""
+        if not self._running:
             return
         try:
-            if self.ring_buffer.available_samples < self._min_analysis_samples:
-                warmup_needed = max(
-                    0,
-                    self._min_analysis_samples - self.ring_buffer.available_samples,
-                )
-                if warmup_needed > 0:
-                    warmup_chunk = self._next_synthetic_chunk(warmup_needed)
-                    self.ring_buffer.write(warmup_chunk)
-                    self._samples_since_last_analysis += len(warmup_chunk)
+            if self.synthetic_mode and not self._receiving_external_chunks:
+                if self.ring_buffer.available_samples < self._min_analysis_samples:
+                    warmup_needed = max(
+                        0,
+                        self._min_analysis_samples - self.ring_buffer.available_samples,
+                    )
+                    if warmup_needed > 0:
+                        warmup_chunk = self._next_synthetic_chunk(warmup_needed)
+                        self.ring_buffer.write(warmup_chunk)
+                        self.drift_estimator.update(len(warmup_chunk))
+                        self._samples_since_last_analysis += len(warmup_chunk)
 
-            chunk = self._next_synthetic_chunk(self.chunk_size)
-            self._ingest_chunk(chunk)
+                visual_samples = max(
+                    256,
+                    int(round((self.VISUAL_TIMER_INTERVAL_MS / 1000.0) * self.config.sample_rate)),
+                )
+                synth_chunk = self._next_synthetic_chunk(visual_samples)
+                self.ring_buffer.write(synth_chunk)
+                self.drift_estimator.update(len(synth_chunk))
+                self._samples_since_last_analysis += len(synth_chunk)
+
+                if not self._has_emitted_telemetry:
+                    self._on_telemetry_timer_tick()
+
+            avail = self.ring_buffer.available_samples
+            if avail <= 0:
+                return
+
+            effective_fs = float(self.drift_estimator.effective_fs)
+            wave_samples = min(
+                avail,
+                max(64, int(round((self.WAVEFORM_WINDOW_MS / 1000.0) * effective_fs))),
+            )
+            latest_wave = self.ring_buffer.read_latest(wave_samples)
+            time_axis, wave_win = self._extract_waveform_window(
+                latest_wave,
+                effective_fs=effective_fs,
+                step_idx=self._waveform_step_idx,
+                window_ms=self.WAVEFORM_WINDOW_MS,
+            )
+            self._waveform_step_idx += 1
+            if len(time_axis) > 0:
+                self.waveform_ready.emit(time_axis, wave_win)
         except Exception as exc:
-            logger.error("Error in synthetic timer tick: %s", exc, exc_info=True)
+            logger.error("Error in visual timer tick: %s", exc, exc_info=True)
             self.error_occurred.emit(str(exc))
+
+    @pyqtSlot()
+    def _on_telemetry_timer_tick(self) -> None:
+        """Decoupled 4 Hz (250 ms) DSP timer: runs DSPEngine.process_window on the worker QThread."""
+        if not self._running:
+            return
+        try:
+            effective_fs = float(self.drift_estimator.effective_fs)
+            self.drift_updated.emit(
+                effective_fs,
+                float(self.drift_estimator.drift_ppm),
+                float(self.drift_estimator.rate_bias_spd),
+            )
+
+            if (
+                self.ring_buffer.available_samples >= self._min_analysis_samples
+                and self._samples_since_last_analysis > 0
+            ):
+                self._samples_since_last_analysis = 0
+                window = self.ring_buffer.read_latest(self._window_samples)
+                telemetry: BeatTelemetry = self.dsp_engine.process_window(
+                    window,
+                    bph=self.config.bph,
+                    lift_angle=self.config.lift_angle,
+                    effective_fs=effective_fs,
+                    streaming=False,
+                )
+                self._has_emitted_telemetry = True
+                self.telemetry_ready.emit(telemetry)
+        except Exception as exc:
+            logger.error("Error in telemetry timer tick: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+
+    _on_synthetic_timer_tick = _on_visual_timer_tick
 
     @pyqtSlot(object)
     def push_audio_chunk(
@@ -535,7 +655,7 @@ class DSPStreamWorker(QObject):
         chunk: NDArray[np.float64],
         timestamp_ns: int | None = None,
     ) -> None:
-        """Ingest an external audio chunk into the ring buffer and trigger DSP analysis.
+        """Ingest an external audio chunk into the ring buffer and trigger DSP analysis when hop is met.
 
         Args:
             chunk: 1D float64 NumPy array of audio samples.
@@ -549,7 +669,7 @@ class DSPStreamWorker(QObject):
         chunk: NDArray[np.float64],
         timestamp_ns: int | None = None,
     ) -> None:
-        """Write chunk to ring buffer, update clock drift estimator, and run DSP when ready."""
+        """Write chunk to ring buffer, update clock drift estimator, and run DSP at hop interval."""
         try:
             if chunk is None:
                 raise ValueError("Audio chunk must not be None")
@@ -561,12 +681,6 @@ class DSPStreamWorker(QObject):
 
             self.ring_buffer.write(samples)
             effective_fs = self.drift_estimator.update(n_samples, timestamp_ns=timestamp_ns)
-            self.drift_updated.emit(
-                float(effective_fs),
-                float(self.drift_estimator.drift_ppm),
-                float(self.drift_estimator.rate_bias_spd),
-            )
-
             self._samples_since_last_analysis += n_samples
 
             if (
@@ -574,6 +688,11 @@ class DSPStreamWorker(QObject):
                 and self._samples_since_last_analysis >= self._analysis_hop_samples
             ):
                 self._samples_since_last_analysis = 0
+                self.drift_updated.emit(
+                    float(effective_fs),
+                    float(self.drift_estimator.drift_ppm),
+                    float(self.drift_estimator.rate_bias_spd),
+                )
                 window = self.ring_buffer.read_latest(self._window_samples)
                 telemetry: BeatTelemetry = self.dsp_engine.process_window(
                     window,
@@ -593,7 +712,12 @@ class DSPStreamWorker(QObject):
                 )
                 self._waveform_step_idx += 1
                 self.waveform_ready.emit(time_axis, wave_win)
-            elif not self._has_emitted_telemetry:
+            elif not self._has_emitted_telemetry and n_samples >= 1024:
+                self.drift_updated.emit(
+                    float(effective_fs),
+                    float(self.drift_estimator.drift_ppm),
+                    float(self.drift_estimator.rate_bias_spd),
+                )
                 time_axis, wave_win = self._extract_waveform_window(
                     samples,
                     effective_fs=effective_fs,

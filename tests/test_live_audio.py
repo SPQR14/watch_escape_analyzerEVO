@@ -279,3 +279,116 @@ def test_dsp_engine_shock_blanking_and_agc_on_50ms_mechanical_bump() -> None:
         np.testing.assert_allclose(gated, silence_noise)
     finally:
         engine.shutdown()
+
+
+def test_piezo_contact_mic_pipewire_128_quantum_no_false_blanking_or_glitch_spam(
+    caplog: object,
+) -> None:
+    """Verify real-world CM108 piezo impulses at PipeWire quantum=128 are never falsely blanked."""
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    fs = 48000
+    config = WatchConfig(bph=21600, lift_angle=52.0, sample_rate=fs)
+    true_rate_spd = -2.4
+    true_be_ms = 0.25
+    true_amp_deg = 278.0
+
+    gen = SyntheticEscapeGenerator(config=config, seed=404)
+    piezo_signal = gen.generate(
+        duration_s=6.0,
+        true_rate_spd=true_rate_spd,
+        true_beat_error_ms=true_be_ms,
+        true_amplitude_deg=true_amp_deg,
+        snr_db=34.0,
+    )
+    # Add low-frequency desk rumble (60 Hz + 180 Hz) that the 3000-14000 Hz bandpass must reject
+    t_vec = np.arange(len(piezo_signal), dtype=np.float64) / float(fs)
+    piezo_signal = (
+        piezo_signal
+        + 0.25 * np.sin(2.0 * np.pi * 60.0 * t_vec)
+        + 0.15 * np.sin(2.0 * np.pi * 180.0 * t_vec)
+    )
+
+    engine = DSPEngine(config=config, workers=2)
+    try:
+        filtered = engine.filter_signal(piezo_signal, fs=float(fs))
+        _, _, blank_fraction = engine.blank_transients(
+            filtered,
+            fs=float(fs),
+            raw_signal=piezo_signal,
+        )
+        # Sharp ~2.5 ms watch ticks (~1.55% duty cycle) MUST NEVER be mistaken for macro-shocks!
+        assert blank_fraction == 0.0
+    finally:
+        engine.shutdown()
+
+    captured_stream_kwargs: dict[str, object] = {}
+
+    class FakeInputStream:
+        def __init__(self, **kwargs: object) -> None:
+            captured_stream_kwargs.update(kwargs)
+            self.active = False
+
+        def start(self) -> None:
+            self.active = True
+
+        def stop(self) -> None:
+            self.active = False
+
+        def close(self) -> None:
+            self.active = False
+
+    worker = DSPStreamWorker(
+        config=config,
+        device_id=1,
+        buffer_duration_s=8.0,
+        window_duration_s=3.0,
+        chunk_size=128,
+        synthetic_mode=False,
+        workers=2,
+    )
+    received_telemetry: list[BeatTelemetry] = []
+    worker.telemetry_ready.connect(lambda t: received_telemetry.append(t))
+
+    try:
+        with patch("sounddevice.InputStream", side_effect=FakeInputStream):
+            worker.start_stream()
+            pa_callback = captured_stream_kwargs["callback"]
+            assert callable(pa_callback)
+
+            # Stream 6.0s of audio in 128-frame PipeWire quantum chunks (2.67 ms per callback)
+            # with realistic +-80 us USB scheduling jitter on timestamp_ns.
+            quantum = 128
+            base_ns = 5_000_000_000_000
+            nominal_dt_ns = int(round((quantum / float(fs)) * 1e9))
+            rng = np.random.default_rng(128)
+
+            with patch.object(
+                worker.drift_estimator,
+                "update",
+                wraps=worker.drift_estimator.update,
+            ):
+                for idx, start in enumerate(range(0, len(piezo_signal), quantum)):
+                    chunk_f32 = (
+                        piezo_signal[start : start + quantum].astype(np.float32).reshape(-1, 1)
+                    )
+                    jitter_ns = int(rng.integers(-80_000, 80_000))
+                    ts_ns = base_ns + (idx + 1) * nominal_dt_ns + jitter_ns
+                    with patch("time.perf_counter_ns", return_value=ts_ns):
+                        pa_callback(chunk_f32, len(chunk_f32), {}, None)
+
+            app.processEvents()
+
+            assert len(received_telemetry) >= 1
+            latest = received_telemetry[-1]
+            assert abs(latest.rate_spd - true_rate_spd) <= 0.25
+            assert abs(latest.beat_error_ms - true_be_ms) <= 0.05
+            assert abs(latest.amplitude_deg - true_amp_deg) <= 5.0
+            assert latest.confidence >= 0.85
+            assert abs(worker.drift_estimator.drift_ppm) < 5.0
+
+            if hasattr(caplog, "text"):
+                assert "Rejected ADC clock glitch" not in caplog.text
+    finally:
+        worker.shutdown()

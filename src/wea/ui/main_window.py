@@ -358,6 +358,8 @@ class MainWin(QMainWindow):
 
         # Saved positional telemetry records (starts clean with no pre-populated data)
         self._saved_positions: dict[str, TelemetryResult] = {}
+        self._cached_watch_config: WatchConfig | None = None
+        self._cached_watch_config_key: tuple[int, float, int] | None = None
 
         self.setMinimumSize(1360, 840)
         self._apply_industrial_theme()
@@ -1966,11 +1968,19 @@ class MainWin(QMainWindow):
         self.waveform_plot.setLabel("left", tr("waveform_y"))
 
     def current_watch_config(self) -> WatchConfig:
-        """Build a `WatchConfig` instance from the active Top Bar controls."""
+        """Return a cached `WatchConfig` instance matching the active Top Bar controls."""
         bph = int(self.cmb_bph.currentData() or int(self.cmb_bph.currentText()))
         lift_angle = float(self.spn_lift.value())
         sample_rate = int(self.cmb_srate.currentData() or 48000)
-        return WatchConfig(bph=bph, lift_angle=lift_angle, sample_rate=sample_rate)
+        key = (bph, lift_angle, sample_rate)
+        if self._cached_watch_config is None or self._cached_watch_config_key != key:
+            self._cached_watch_config = WatchConfig(
+                bph=bph,
+                lift_angle=lift_angle,
+                sample_rate=sample_rate,
+            )
+            self._cached_watch_config_key = key
+        return self._cached_watch_config
 
     def _check_session_duration(self) -> None:
         """Automatically stop capture once (stabilization_s + duration_s) has elapsed."""
@@ -2337,9 +2347,14 @@ class MainWin(QMainWindow):
                     dt_p2 = (latest_beat.timestamp_p2 - latest_beat.timestamp_p1) * 1000.0
                     dt_p3 = (latest_beat.timestamp_p3 - latest_beat.timestamp_p1) * 1000.0
 
-                    p3_idx = int(np.argmax(np.abs(norm_wave)))
-                    t_p3_ms = float(t_ms[p3_idx])
-                    t_p1_ms = max(0.2, t_p3_ms - dt_p3)
+                    dom_idx = int(np.argmax(np.abs(norm_wave)))
+                    t_dom_ms = float(t_ms[dom_idx])
+                    if t_dom_ms >= dt_p3 + 0.2 or t_dom_ms + dt_p3 > float(t_ms[-1]):
+                        t_p3_ms = t_dom_ms
+                        t_p1_ms = max(0.2, t_p3_ms - dt_p3)
+                    else:
+                        t_p1_ms = max(0.2, t_dom_ms)
+                        t_p3_ms = min(float(t_ms[-1]), t_p1_ms + dt_p3)
                     t_p2_ms = float(np.clip(t_p1_ms + dt_p2, t_p1_ms, t_p3_ms))
 
                     self.osc_wave_curve.setData(t_ms, norm_wave)
@@ -2353,6 +2368,7 @@ class MainWin(QMainWindow):
 
                     p1_idx = int(np.clip(round((t_p1_ms / 1000.0) * fs), 0, len(norm_wave) - 1))
                     p2_idx = int(np.clip(round((t_p2_ms / 1000.0) * fs), 0, len(norm_wave) - 1))
+                    p3_idx = int(np.clip(round((t_p3_ms / 1000.0) * fs), 0, len(norm_wave) - 1))
 
                     spots = [
                         {

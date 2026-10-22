@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import threading
 import time
 from collections import deque
 
@@ -233,6 +234,7 @@ class SampleRateDriftEstimator:
         self.ema_alpha: float = float(np.clip(ema_alpha, 0.01, 1.0))
         self.cpu_skew_ppm: float = float(cpu_skew_ppm)
 
+        self._lock = threading.Lock()
         self._history: deque[tuple[float, float]] = deque()
         self._window: deque[tuple[float, float]] = self._history
         self._origin_ns: int | None = None
@@ -262,16 +264,17 @@ class SampleRateDriftEstimator:
 
     def reset(self) -> None:
         """Clear the dynamic sliding window and reset cumulative sample and EMA state."""
-        self._history.clear()
-        self._origin_ns = None
-        self._last_elapsed_sec = None
-        self._last_recalc_sec = -float("inf")
-        self._cumulative_samples = 0.0
-        self._chunk_count = 0
-        self._ols_eval_count = 0
-        self._dynamic_fs = float(self.nominal_fs)
-        self._dynamic_drift_ppm = 0.0
-        self._is_converged = False
+        with self._lock:
+            self._history.clear()
+            self._origin_ns = None
+            self._last_elapsed_sec = None
+            self._last_recalc_sec = -float("inf")
+            self._cumulative_samples = 0.0
+            self._chunk_count = 0
+            self._ols_eval_count = 0
+            self._dynamic_fs = float(self.nominal_fs)
+            self._dynamic_drift_ppm = 0.0
+            self._is_converged = False
         logger.debug("SampleRateDriftEstimator dynamic tracking state reset")
 
     @property
@@ -323,97 +326,84 @@ class SampleRateDriftEstimator:
             logger.warning("Rejected negative chunk_samples=%.2f", n_samp)
             return self.effective_fs
 
-        if elapsed_sec is not None:
-            t_sec = float(elapsed_sec)
-        else:
-            now_ns = int(timestamp_ns) if timestamp_ns is not None else time.perf_counter_ns()
-            if self._origin_ns is None:
-                self._origin_ns = now_ns
-            t_sec = (now_ns - self._origin_ns) * 1e-9
+        with self._lock:
+            if elapsed_sec is not None:
+                t_sec = float(elapsed_sec)
+            else:
+                now_ns = int(timestamp_ns) if timestamp_ns is not None else time.perf_counter_ns()
+                if self._origin_ns is None:
+                    self._origin_ns = now_ns
+                t_sec = (now_ns - self._origin_ns) * 1e-9
 
-        if len(self._history) == 0:
-            self._dynamic_fs = float(self.nominal_fs)
-            if t_sec == 0.0:
-                self._history.append((0.0, n_samp))
-                self._last_elapsed_sec = 0.0
-                self._cumulative_samples = n_samp
-                self._chunk_count = 1
-            elif t_sec > 0.0 and n_samp > 0.0:
-                inst_fs = n_samp / t_sec
-                inst_ppm = ((inst_fs - self.nominal_fs) / self.nominal_fs) * 1e6
-                if abs(inst_ppm) <= self.max_drift_ppm:
+            if len(self._history) == 0:
+                self._dynamic_fs = float(self.nominal_fs)
+                if t_sec <= 0.0:
+                    self._history.append((0.0, n_samp))
+                    self._last_elapsed_sec = 0.0
+                    self._cumulative_samples = n_samp
+                    self._chunk_count = 1
+                elif n_samp > 0.0:
                     self._history.append((0.0, 0.0))
                     self._history.append((t_sec, n_samp))
                     self._last_elapsed_sec = t_sec
                     self._cumulative_samples = n_samp
                     self._chunk_count = 1
+                return self.effective_fs
+
+            last_t = self._last_elapsed_sec if self._last_elapsed_sec is not None else 0.0
+            dt = t_sec - last_t
+            if dt <= 0.0:
+                return self.effective_fs
+
+            # For coarse synthetic/macro steps (dt >= 0.25s), ignore extreme sample-count glitches
+            # silently without logging false warnings on short real-time PipeWire/USB packets.
+            if dt >= 0.25:
+                inst_fs = n_samp / dt
+                inst_ppm = ((inst_fs - self.nominal_fs) / self.nominal_fs) * 1e6
+                if abs(inst_ppm) > self.max_drift_ppm:
+                    self._last_elapsed_sec = t_sec
+                    return self.effective_fs
+
+            valid_elapsed = self._history[-1][0] + dt
+            self._cumulative_samples += n_samp
+            self._last_elapsed_sec = t_sec
+            self._chunk_count += 1
+            self._history.append((valid_elapsed, self._cumulative_samples))
+
+            cutoff_elapsed = valid_elapsed - self.window_sec
+            while len(self._history) > 2 and self._history[0][0] < cutoff_elapsed:
+                self._history.popleft()
+
+            span_sec = self._history[-1][0] - self._history[0][0]
+            if (
+                self._chunk_count >= self.min_chunks
+                and span_sec >= self.min_duration_sec - 1e-9
+                and len(self._history) >= 2
+                and (valid_elapsed - self._last_recalc_sec) >= self.recalc_interval_sec - 1e-9
+            ):
+                self._last_recalc_sec = valid_elapsed
+                self._ols_eval_count += 1
+                raw_slope = self._compute_centered_ols_fs()
+                ols_ppm = ((raw_slope - self.nominal_fs) / self.nominal_fs) * 1e6
+                if abs(ols_ppm) <= self.max_drift_ppm:
+                    if not self._is_converged:
+                        self._dynamic_fs = float(raw_slope)
+                        self._is_converged = True
+                    else:
+                        self._dynamic_fs = float(
+                            self.ema_alpha * raw_slope + (1.0 - self.ema_alpha) * self._dynamic_fs
+                        )
+                    self._dynamic_drift_ppm = float(
+                        ((self._dynamic_fs - self.nominal_fs) / self.nominal_fs) * 1e6
+                    )
                 else:
                     logger.warning(
-                        "Rejected initial chunk glitch (inst_ppm=%+.2f exceeds ±%.1f ppm)",
-                        inst_ppm,
+                        "Rejected OLS regression drift %+.2f ppm exceeding ±%.1f ppm guardrail",
+                        ols_ppm,
                         self.max_drift_ppm,
                     )
-                    self._history.append((0.0, 0.0))
-                    self._last_elapsed_sec = t_sec
+
             return self.effective_fs
-
-        last_t = self._last_elapsed_sec if self._last_elapsed_sec is not None else 0.0
-        dt = t_sec - last_t
-        if dt <= 0.0:
-            logger.warning("Rejected non-monotonic clock drift update (dt=%.6f s)", dt)
-            return self.effective_fs
-
-        inst_fs = n_samp / dt
-        inst_ppm = ((inst_fs - self.nominal_fs) / self.nominal_fs) * 1e6
-        if abs(inst_ppm) > self.max_drift_ppm:
-            logger.warning(
-                "Rejected ADC clock glitch: chunk drift %+.2f ppm exceeds ±%.1f ppm guardrail",
-                inst_ppm,
-                self.max_drift_ppm,
-            )
-            self._last_elapsed_sec = t_sec
-            return self.effective_fs
-
-        valid_elapsed = self._history[-1][0] + dt
-        self._cumulative_samples += n_samp
-        self._last_elapsed_sec = t_sec
-        self._chunk_count += 1
-        self._history.append((valid_elapsed, self._cumulative_samples))
-
-        cutoff_elapsed = valid_elapsed - self.window_sec
-        while len(self._history) > 2 and self._history[0][0] < cutoff_elapsed:
-            self._history.popleft()
-
-        span_sec = self._history[-1][0] - self._history[0][0]
-        if (
-            self._chunk_count >= self.min_chunks
-            and span_sec >= self.min_duration_sec - 1e-9
-            and len(self._history) >= 2
-            and (valid_elapsed - self._last_recalc_sec) >= self.recalc_interval_sec - 1e-9
-        ):
-            self._last_recalc_sec = valid_elapsed
-            self._ols_eval_count += 1
-            raw_slope = self._compute_centered_ols_fs()
-            ols_ppm = ((raw_slope - self.nominal_fs) / self.nominal_fs) * 1e6
-            if abs(ols_ppm) <= self.max_drift_ppm:
-                if not self._is_converged:
-                    self._dynamic_fs = float(raw_slope)
-                    self._is_converged = True
-                else:
-                    self._dynamic_fs = float(
-                        self.ema_alpha * raw_slope + (1.0 - self.ema_alpha) * self._dynamic_fs
-                    )
-                self._dynamic_drift_ppm = float(
-                    ((self._dynamic_fs - self.nominal_fs) / self.nominal_fs) * 1e6
-                )
-            else:
-                logger.warning(
-                    "Rejected OLS regression drift %+.2f ppm exceeding ±%.1f ppm guardrail",
-                    ols_ppm,
-                    self.max_drift_ppm,
-                )
-
-        return self.effective_fs
 
     add_chunk = update
     record_chunk = update
