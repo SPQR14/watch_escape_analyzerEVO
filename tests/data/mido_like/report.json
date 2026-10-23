@@ -1,0 +1,67 @@
+{
+  "bph": 21600,
+  "lift_angle": 51.0,
+  "source": "SYNTHETIC preset 'mido_like' (not a real recording)",
+  "synthetic_truth": {
+    "rate_spd": 5.0,
+    "beat_error_ms": 0.23,
+    "amplitude_deg": 299.0,
+    "sound_levels": [
+      0.2,
+      0.5,
+      1.0
+    ],
+    "snr_db": 15.0,
+    "decay_s": 0.002
+  },
+  "fs": 48000,
+  "seconds": 30.0,
+  "results": [
+    {
+      "detector": "engine",
+      "n_beats": 179,
+      "ols_rate_spd": 5.075773365779401,
+      "fit_rate_spd": 4.88533498313034,
+      "n_inliers": 150,
+      "fit_beat_error_ms": 0.22140253928118503,
+      "residual_sigma_us": 142.70056200166374,
+      "classification": "subevent_steps",
+      "summary": "Steps: 2 groups 1.41 ms apart [-0.01 ms (84%), +1.39 ms (16%)] - onset jumps between escapement sub-events P1/P2/P3",
+      "cluster_centers_us": [
+        -12.002014627920943,
+        1394.8044481963962
+      ],
+      "cluster_fractions": [
+        0.8379888268156425,
+        0.16201117318435754
+      ],
+      "carrier_hz": 6005.859375,
+      "window_rate_mean_spd": 7.28579033766361,
+      "window_rate_std_spd": 9.711410056513825,
+      "window_rate_min_spd": -30.340288359992407,
+      "window_rate_max_spd": 37.82324957761016
+    },
+    {
+      "detector": "onset",
+      "n_beats": 179,
+      "ols_rate_spd": 5.017673220160445,
+      "fit_rate_spd": 5.017673220160445,
+      "n_inliers": 179,
+      "fit_beat_error_ms": 0.22757606177315334,
+      "residual_sigma_us": 43.35191773534408,
+      "classification": "bell",
+      "summary": "Bell: one cluster, robust sigma 43.4 us",
+      "cluster_centers_us": [
+        -23.61332165176526
+      ],
+      "cluster_fractions": [
+        1.0
+      ],
+      "carrier_hz": 6005.859375,
+      "window_rate_mean_spd": 5.009440895354021,
+      "window_rate_std_spd": 1.0394234103256303,
+      "window_rate_min_spd": 2.931410825948713,
+      "window_rate_max_spd": 7.015433545917276
+    }
+  ]
+}
