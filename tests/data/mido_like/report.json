@@ -58,10 +58,10 @@
         1.0
       ],
       "carrier_hz": 6005.859375,
-      "window_rate_mean_spd": 5.009440895354021,
-      "window_rate_std_spd": 1.0394234103256303,
-      "window_rate_min_spd": 2.931410825948713,
-      "window_rate_max_spd": 7.015433545917276
+      "window_rate_mean_spd": 5.04421207356796,
+      "window_rate_std_spd": 0.11246697563573274,
+      "window_rate_min_spd": 4.788330423543675,
+      "window_rate_max_spd": 5.234548577833804
     }
   ]
 }

@@ -166,3 +166,31 @@ class AudioRingBuffer:
                 self._read_scratch[first_part:count] = self._buffer[:second_part]
 
             return self._read_scratch[:count].copy()
+
+    def read_since(self, abs_start: int) -> tuple[int, NDArray[np.float64]]:
+        """Read every sample written from absolute position ``abs_start`` onwards.
+
+        Positions count samples since the last :meth:`clear` (``total_samples_written``).
+        If part of the requested range was already overwritten (or ``abs_start`` lies beyond
+        the data, e.g. after a clear), the returned start is the oldest available sample, so
+        callers can detect the gap by comparing it with ``abs_start``.
+
+        Returns:
+            ``(actual_start, samples)``.
+        """
+        with self._lock:
+            total = self._total_samples_written
+            oldest = total - self._available_samples
+            start = int(abs_start)
+            if start < oldest or start > total:
+                start = oldest
+            count = total - start
+            if count <= 0:
+                return start, np.empty(0, dtype=self._dtype)
+            start_pos = (self._write_pos - count) % self._capacity
+            first_part = min(count, self._capacity - start_pos)
+            out = np.empty(count, dtype=self._dtype)
+            out[:first_part] = self._buffer[start_pos : start_pos + first_part]
+            if count > first_part:
+                out[first_part:] = self._buffer[: count - first_part]
+            return start, out

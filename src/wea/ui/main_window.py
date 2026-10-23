@@ -44,7 +44,8 @@ from PyQt6.QtWidgets import (
 )
 
 from wea.core.dsp_pipeline import EscapeDSPPipeline
-from wea.core.models import BeatEvent, BeatTelemetry, TelemetryResult, WatchConfig
+from wea.core.models import BeatEvent, BeatTelemetry, TelemetryResult, TimingUpdate, WatchConfig
+from wea.core.rate_regression import RateFit, fit_rate_be
 from wea.core.ring_buffer import AudioRingBuffer
 from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.i18n.translator import Translator
@@ -339,6 +340,12 @@ class MainWin(QMainWindow):
 
         # Telemetry history for statistics & horizontal paper tape trace
         self._rate_history: list[float] = []
+        # Beats measured after stabilization (stream sample positions) for the session fit
+        self._meas_index: list[int] = []
+        self._meas_sample: list[float] = []
+        self._meas_segment: list[int] = []
+        self._meas_fs: float = 48000.0
+        self._meas_period_s: float = 0.0
         self._tape_times_even: list[float] = []
         self._tape_rate_even: list[float] = []
         self._tape_times_odd: list[float] = []
@@ -2037,6 +2044,10 @@ class MainWin(QMainWindow):
 
         logger.info("Starting telemetry capture session")
         self._rate_history.clear()
+        self._meas_index.clear()
+        self._meas_sample.clear()
+        self._meas_segment.clear()
+        self._meas_period_s = 0.0
         self._session_records.clear()
         self._tape_times_even.clear()
         self._tape_rate_even.clear()
@@ -2303,13 +2314,18 @@ class MainWin(QMainWindow):
         self.prg_snr.setValue(quality_pct)
         self.lbl_snr_value.setText(f"{raw_snr_db:.1f} dB ({quality_pct}%)")
 
+        timing = getattr(telemetry, "timing", None)
+        rate_valid = bool(getattr(telemetry, "rate_valid", True))
+        be_valid = timing is None or timing.window_fit is not None
         sign_str = "+" if rate_spd >= 0 else ""
-        self.card_rate.set_value(f"{sign_str}{rate_spd:.1f}")
-        self.card_beat_error.set_value(f"{beat_error_ms:.2f}")
+        self.card_rate.set_value(f"{sign_str}{rate_spd:.1f}" if rate_valid else "---.-")
+        self.card_beat_error.set_value(f"{beat_error_ms:.2f}" if be_valid else "-.--")
         self.card_amplitude.set_value(f"{amplitude_deg:.0f}°")
 
         cfg_now = self.current_watch_config()
-        if should_record_tape:
+        if should_record_tape and timing is not None:
+            self._append_measurement_beats(timing)
+        if should_record_tape and rate_valid:
             self._rate_history.append(rate_spd)
             self._session_records.append(
                 {
@@ -2329,15 +2345,7 @@ class MainWin(QMainWindow):
                 }
             )
 
-            r_max = max(self._rate_history)
-            r_min = min(self._rate_history)
-            r_delta = r_max - r_min
-            r_mean = float(np.mean(self._rate_history))
-
-            self.lbl_stat_max_val.setText(f"{r_max:+.2f} s/d")
-            self.lbl_stat_min_val.setText(f"{r_min:+.2f} s/d")
-            self.lbl_stat_delta_val.setText(f"{r_delta:.2f} s/d")
-            self.lbl_stat_mean_val.setText(f"{r_mean:+.2f} s/d")
+            self._update_rate_statistics()
 
             half_be_offset = 0.5 * beat_error_ms
             self._tape_times_even.append(t_meas)
@@ -2442,6 +2450,48 @@ class MainWin(QMainWindow):
             self.stop_capture()
 
     WAVEFORM_MIN_INTERVAL_S: float = 1.0 / 30.0
+
+    def _append_measurement_beats(self, timing: TimingUpdate) -> None:
+        """Accumulate the beats measured after stabilization (session regression, tape)."""
+        if timing.nominal_period_s != self._meas_period_s:
+            # BPH changed (e.g. auto-corrected): beats of another period cannot be mixed
+            self._meas_index.clear()
+            self._meas_sample.clear()
+            self._meas_segment.clear()
+            self._meas_period_s = float(timing.nominal_period_s)
+        self._meas_fs = float(timing.fs_eff)
+        self._meas_index.extend(int(v) for v in timing.indices)
+        self._meas_sample.extend(float(v) for v in timing.samples)
+        self._meas_segment.extend(int(v) for v in timing.segments)
+
+    def session_rate_fit(self) -> RateFit | None:
+        """Regression ``t = a n + b + c (n mod 2)`` over every measured beat of the session."""
+        if not self._meas_sample or self._meas_period_s <= 0.0:
+            return None
+        return fit_rate_be(
+            np.asarray(self._meas_sample) / self._meas_fs,
+            self._meas_period_s,
+            indices=np.asarray(self._meas_index),
+            segments=np.asarray(self._meas_segment),
+        )
+
+    def _update_rate_statistics(self) -> None:
+        """Max / Min / Delta of the windowed rates; Mean = regression over the session.
+
+        Averaging the windowed rates would weight overlapping windows unevenly; the session
+        regression uses the same beats and model as the RATE indicator, so they agree.
+        """
+        if self._rate_history:
+            r_max = max(self._rate_history)
+            r_min = min(self._rate_history)
+            self.lbl_stat_max_val.setText(f"{r_max:+.2f} s/d")
+            self.lbl_stat_min_val.setText(f"{r_min:+.2f} s/d")
+            self.lbl_stat_delta_val.setText(f"{r_max - r_min:.2f} s/d")
+        session = self.session_rate_fit()
+        if session is not None:
+            self.lbl_stat_mean_val.setText(f"{session.rate_spd:+.2f} s/d")
+        elif self._rate_history:
+            self.lbl_stat_mean_val.setText(f"{float(np.mean(self._rate_history)):+.2f} s/d")
 
     def _on_waveform_ready(self, time_axis: np.ndarray, waveform: np.ndarray) -> None:
         """Slot updating the real-time acoustic waveform curve from DSPStreamWorker.

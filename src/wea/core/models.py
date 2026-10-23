@@ -92,6 +92,33 @@ class TelemetryResult:
 
 
 @dataclass(slots=True)
+class TimingUpdate:
+    """Beat-timing results of one analysis step (onset tracker + rate regression).
+
+    Attributes:
+        indices: Integer beat index ``n`` of each new beat.
+        samples: Onset position of each new beat in session samples (monotonic).
+        segments: Continuous-audio segment id of each new beat.
+        fs_eff: Effective (calibrated) sample rate to convert samples to seconds.
+        nominal_period_s: Nominal beat period ``T`` of the analysis.
+        window_fit: Regression over the sliding window (``RateFit``) or ``None``.
+        window_s: Sliding window length in seconds.
+        snr_db: Beat SNR over the window (see ``wea.core.beat_timing.beat_snr_db``).
+        session_s: Session time (s) at the end of the processed audio.
+    """
+
+    indices: NDArray[np.int64]
+    samples: NDArray[np.float64]
+    segments: NDArray[np.int64]
+    fs_eff: float
+    nominal_period_s: float
+    window_fit: object | None = None
+    window_s: float = 15.0
+    snr_db: float = 0.0
+    session_s: float = 0.0
+
+
+@dataclass(slots=True)
 class BeatTelemetry:
     """Structured horological telemetry and acoustic envelope from DSPEngine.
 
@@ -110,6 +137,9 @@ class BeatTelemetry:
         bph: Beat rate (BPH) actually used for the analysis (0 if unknown).
         detected_bph: BPH detected from the signal autocorrelation (0 if undetermined).
         bph_mismatch: True when the configured BPH does not match the detected one.
+        timing: Onset/regression results; when present, ``rate_spd``, ``beat_error_ms``
+            and ``snr_db`` come from it.
+        rate_valid: False while there are too few beats for a rate regression.
     """
 
     rate_spd: float
@@ -130,3 +160,5 @@ class BeatTelemetry:
     bph: int = 0
     detected_bph: int = 0
     bph_mismatch: bool = False
+    timing: TimingUpdate | None = None
+    rate_valid: bool = True

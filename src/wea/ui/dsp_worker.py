@@ -9,9 +9,11 @@ import numpy as np
 from numpy.typing import NDArray
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
+from wea.core.beat_timing import OnsetBeatTracker, OnsetConfig, beat_snr_db
 from wea.core.clock_drift import AtomicNTPDiscipline, SampleRateDriftEstimator
 from wea.core.dsp_engine import DSPEngine
-from wea.core.models import BeatTelemetry, WatchConfig
+from wea.core.models import BeatTelemetry, TimingUpdate, WatchConfig
+from wea.core.rate_regression import SlidingRateEstimator
 from wea.core.ring_buffer import AudioRingBuffer
 from wea.core.synthetic import SyntheticEscapeGenerator
 from wea.utils.audio_io import HardwareAudioCapture
@@ -70,6 +72,8 @@ class DSPStreamWorker(QObject):
         workers: int | None = None,
         adc_dynamic_drift: bool = False,
         analysis_in_background: bool = False,
+        rate_window_s: float = 15.0,
+        onset_config: OnsetConfig | None = None,
         parent: QObject | None = None,
     ) -> None:
         """Initialize the real-time DSP worker and its underlying mathematical components.
@@ -95,6 +99,8 @@ class DSPStreamWorker(QObject):
                 thread so this worker's event loop keeps emitting 30 FPS waveforms while a
                 window is being analyzed. Windows arriving while an analysis is in flight are
                 skipped (the next tick analyzes the newest audio).
+            rate_window_s: Sliding window of the rate / beat-error regression in seconds.
+            onset_config: Parameters of the P1 onset tracker (band, threshold, gate...).
             parent: Optional Qt parent object.
         """
         super().__init__(parent)
@@ -141,6 +147,12 @@ class DSPStreamWorker(QObject):
         self._analysis_future: Future | None = None
         # Bumped on start/stop/config changes so stale background results are dropped.
         self._analysis_generation: int = 0
+
+        # Onset tracker + sliding regression: rate, beat error, SNR and paper-tape beats
+        self.rate_window_s: float = max(3.0, float(rate_window_s))
+        self.onset_config: OnsetConfig = onset_config if onset_config is not None else OnsetConfig()
+        self._timing_lock = threading.Lock()
+        self._reset_timing()
 
         self._window_samples: int = 0
         self._min_analysis_samples: int = 0
@@ -409,6 +421,7 @@ class DSPStreamWorker(QObject):
         self.drift_estimator.reset()
         self.dsp_engine.reset_filter_state()
         self._reset_synthetic_state()
+        self._reset_timing()
 
         if self.device_id is not None:
             try:
@@ -481,6 +494,7 @@ class DSPStreamWorker(QObject):
             self.dsp_engine.config = config
             self.dsp_engine.reset_filter_state()
             self._analysis_generation += 1
+            self._reset_timing()
             self._recompute_window_thresholds()
             self._samples_since_last_analysis = 0
             self._eval_queued = False
@@ -715,6 +729,84 @@ class DSPStreamWorker(QObject):
             self._run_analysis, window, bph, lift, effective_fs, generation
         )
 
+    # Rate is reported once the regression covers at least this much audio
+    MIN_RATE_SPAN_S: float = 3.0
+
+    def _reset_timing(self) -> None:
+        """Start a new onset-tracking / regression session (stream start, config change)."""
+        with self._timing_lock:
+            self.beat_tracker = OnsetBeatTracker(
+                fs=float(self.config.sample_rate),
+                bph=int(self.config.bph),
+                lift_angle=float(self.config.lift_angle),
+                config=self.onset_config,
+            )
+            self.rate_estimator = SlidingRateEstimator(
+                self.config.nominal_beat_period, window_s=self.rate_window_s
+            )
+            self._rb_pos = 0
+            self._session_offset = 0
+            self._timing_disc_seen = self.discontinuity_count
+            self._bph_candidate = 0
+            self._bph_candidate_count = 0
+
+    def set_rate_window_s(self, window_s: float) -> None:
+        """Change the regression window length (takes effect on the next fit)."""
+        self.rate_window_s = max(3.0, float(window_s))
+        with self._timing_lock:
+            self.rate_estimator.window_s = self.rate_window_s
+
+    def _update_timing(self, effective_fs: float, bph: int | None = None) -> TimingUpdate:
+        """Feed the audio written since the last call to the onset tracker and refit.
+
+        Reads by absolute ring-buffer position, so every sample is processed exactly once;
+        an overflow reset (or audio lost because the analysis lagged behind the buffer)
+        starts a new tracker segment instead of gluing audio across the gap.
+
+        Args:
+            effective_fs: Calibrated sample rate used to convert sample positions to time.
+            bph: Beat rate to track (the engine's auto-detected BPH when the configured one
+                does not match the watch). A change restarts tracking with the new period.
+        """
+        with self._timing_lock:
+            if bph is not None and int(bph) > 0 and int(bph) != self.beat_tracker.bph:
+                logger.info("Onset tracker switching from %d to %d BPH", self.beat_tracker.bph, bph)
+                resume_at = self.beat_tracker.next_sample
+                segment = self.beat_tracker.segment + 1
+                self.beat_tracker = OnsetBeatTracker(
+                    fs=float(self.config.sample_rate),
+                    bph=int(bph),
+                    lift_angle=float(self.config.lift_angle),
+                    config=self.onset_config,
+                )
+                self.beat_tracker.segment = segment
+                self.beat_tracker.reset(resume_at)
+                self.rate_estimator = SlidingRateEstimator(
+                    3600.0 / float(bph), window_s=self.rate_window_s
+                )
+            start, samples = self.ring_buffer.read_since(self._rb_pos)
+            disc = self.discontinuity_count != self._timing_disc_seen
+            if disc or start != self._rb_pos:
+                self._timing_disc_seen = self.discontinuity_count
+                self._session_offset = self.beat_tracker.next_sample - start
+                self.beat_tracker.mark_discontinuity(start + self._session_offset)
+            self._rb_pos = start + len(samples)
+            onsets = self.beat_tracker.process(samples, start_sample=start + self._session_offset)
+            self.rate_estimator.add(onsets)
+            fit = self.rate_estimator.fit(effective_fs)
+            peaks, noises = self.rate_estimator.window_levels()
+            return TimingUpdate(
+                indices=np.array([b.index for b in onsets], dtype=np.int64),
+                samples=np.array([b.sample for b in onsets], dtype=np.float64),
+                segments=np.array([b.segment for b in onsets], dtype=np.int64),
+                fs_eff=float(effective_fs),
+                nominal_period_s=float(self.beat_tracker.period_samples / self.beat_tracker.fs),
+                window_fit=fit,
+                window_s=self.rate_window_s,
+                snr_db=beat_snr_db(peaks, noises),
+                session_s=self.beat_tracker.next_sample / float(effective_fs),
+            )
+
     def _run_analysis(
         self,
         window: NDArray[np.float64],
@@ -722,8 +814,13 @@ class DSPStreamWorker(QObject):
         lift_angle: float,
         effective_fs: float,
         generation: int,
+        require_running: bool = True,
     ) -> None:
-        """Run ``DSPEngine.process_window`` and emit the telemetry if still current."""
+        """Run onset timing + ``DSPEngine.process_window`` and emit the telemetry if current.
+
+        Rate, beat error and SNR shown to the user come from the onset regression; the
+        window engine still provides amplitude, beat waveforms and confidence.
+        """
         try:
             telemetry: BeatTelemetry = self.dsp_engine.process_window(
                 window,
@@ -732,12 +829,33 @@ class DSPStreamWorker(QObject):
                 effective_fs=effective_fs,
                 streaming=False,
             )
+            # Track at the BPH the engine actually used (auto-corrected on a mismatch); a
+            # change must be seen on two consecutive windows so one bad window cannot reset it
+            desired = int(telemetry.bph or bph)
+            switch_to = None
+            if desired != self.beat_tracker.bph:
+                if desired == self._bph_candidate:
+                    self._bph_candidate_count += 1
+                else:
+                    self._bph_candidate, self._bph_candidate_count = desired, 1
+                if self._bph_candidate_count >= 2:
+                    switch_to = desired
+            else:
+                self._bph_candidate, self._bph_candidate_count = 0, 0
+            timing = self._update_timing(effective_fs, switch_to)
         except Exception as exc:
             logger.error("Error in DSP analysis: %s", exc, exc_info=True)
             self.error_occurred.emit(str(exc))
             return
-        if generation != self._analysis_generation or not self._running:
+        if generation != self._analysis_generation or (require_running and not self._running):
             return
+        fit = timing.window_fit
+        telemetry.timing = timing
+        telemetry.snr_db = timing.snr_db
+        if fit is not None:
+            telemetry.beat_error_ms = float(fit.beat_error_ms)
+            telemetry.rate_spd = float(fit.rate_spd)
+        telemetry.rate_valid = fit is not None and fit.span_s >= self.MIN_RATE_SPAN_S
         self._has_emitted_telemetry = True
         self.telemetry_ready.emit(telemetry)
 
@@ -788,15 +906,14 @@ class DSPStreamWorker(QObject):
                     float(self.drift_estimator.rate_bias_spd),
                 )
                 window = self.ring_buffer.read_latest(self._window_samples)
-                telemetry: BeatTelemetry = self.dsp_engine.process_window(
+                self._run_analysis(
                     window,
-                    bph=self.config.bph,
-                    lift_angle=self.config.lift_angle,
-                    effective_fs=effective_fs,
-                    streaming=False,
+                    int(self.config.bph),
+                    float(self.config.lift_angle),
+                    float(effective_fs),
+                    self._analysis_generation,
+                    require_running=False,
                 )
-                self._has_emitted_telemetry = True
-                self.telemetry_ready.emit(telemetry)
 
                 time_axis, wave_win = self._extract_waveform_window(
                     window,

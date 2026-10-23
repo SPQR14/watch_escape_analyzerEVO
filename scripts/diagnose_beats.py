@@ -40,6 +40,7 @@ from wea.core.beat_diagnostics import (  # noqa: E402
 )
 from wea.core.beat_timing import detect_onsets  # noqa: E402
 from wea.core.dsp_engine import DSPEngine  # noqa: E402
+from wea.core.rate_regression import fit_rate_be  # noqa: E402
 from wea.core.synthetic import synthesize_escapement  # noqa: E402
 
 SYNTHETIC_PRESETS: dict[str, dict] = {
@@ -109,18 +110,20 @@ def onset_beats(audio: np.ndarray, fs: int, bph: int, lift: float) -> np.ndarray
     return np.asarray([b.sample for b in detect_onsets(audio, fs, bph, lift)]) / float(fs)
 
 
-WINDOW_S = 3.0
+WINDOW_S = 15.0
 
 
 def onset_window_rates(audio: np.ndarray, fs: int, bph: int, lift: float) -> np.ndarray:
-    """Line-fit rate of the onsets in every ``WINDOW_S`` window stepped by 250 ms."""
+    """Regression rate (5-MAD rejection) over every ``WINDOW_S`` window stepped by 250 ms,
+    as the live app now computes it (``wea.core.rate_regression.fit_rate_be``)."""
     times = onset_beats(audio, fs, bph, lift)
     period = 3600.0 / bph
     rates = []
     for start in np.arange(0.0, len(audio) / fs - WINDOW_S + 1e-9, 0.25):
         sel = times[(times >= start) & (times < start + WINDOW_S)]
-        if len(sel) >= 6:
-            rates.append(robust_line_fit(sel, period)[0].rate_spd)
+        fit = fit_rate_be(sel, period)
+        if fit is not None:
+            rates.append(fit.rate_spd)
     return np.asarray(rates, dtype=np.float64)
 
 
@@ -207,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--detector", choices=[*DETECTORS, "all"], default="all")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument(
-        "--window", type=float, default=3.0, help="onset windowed-rate length in s (app used 3)"
+        "--window", type=float, default=15.0, help="onset regression window in s (default 15)"
     )
     args = ap.parse_args(argv)
     logging.disable(logging.WARNING)
