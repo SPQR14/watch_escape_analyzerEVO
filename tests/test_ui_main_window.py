@@ -7,11 +7,12 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import QApplication, QListView
 
-from wea.core.models import BeatEvent, TelemetryResult
+from wea.core.models import BeatEvent, TelemetryResult, TimingUpdate
 from wea.i18n.translator import Translator
 from wea.ui.main_window import MainWin
 from wea.utils.logger_setup import LoggerSetup
@@ -71,11 +72,10 @@ def test_main_window_layout_and_i18n_switching(tmp_path: Path) -> None:
     assert "Global Statistics" in win.btn_global_stats.text()
     assert win.txt_test_name.text() == "Caliber-Test-01"
 
-    # Verify COSC horizontal lines (-4 and +6 labels) and point symbols ('o')
-    assert win.cosc_lower_line.value() == -4.0
-    assert win.cosc_upper_line.value() == 6.0
-    assert win.cosc_lower_line.angle == 0
-    assert win.cosc_upper_line.angle == 0
+    # COSC -4/+6 s/d are reference SLOPES on the phase tape (-rate / 86.4 ms per s)
+    assert np.tan(np.radians(win.cosc_lower_line.angle)) == pytest.approx(4.0 / 86.4)
+    assert np.tan(np.radians(win.cosc_upper_line.angle)) == pytest.approx(-6.0 / 86.4)
+    assert win.tape_zero_line.angle == 0
     assert win.cosc_lower_line.label.format == "-4"
     assert win.cosc_upper_line.label.format == "+6"
     assert win.tape_curve_even.opts["symbol"] == "o"
@@ -130,19 +130,38 @@ def test_main_window_layout_and_i18n_switching(tmp_path: Path) -> None:
     assert win.card_beat_error.value_label.text() == "0.35"
     assert win.card_amplitude.value_label.text() == "278°"
 
-    # Verify both paper tape trace and audio waveform curve contain data
-    x_even, y_even = win.tape_curve_even.getData()
-    assert len(x_even) == 2
-    assert np.allclose(y_even, y_even[0])
+    # The legacy summary path updates the audio waveform but never fakes a paper tape
+    x_even, _ = win.tape_curve_even.getData()
+    assert x_even is None or len(x_even) == 0
     x_wave, y_wave = win.audio_waveform_curve.getData()
     assert len(x_wave) > 0
     assert len(y_wave) > 0
 
-    # Verify "Centrar Trazo" auto-centers Y-axis around current trace values (~5.4 s/d)
+    # Real beats (+5.4 s/d, 0.35 ms) draw a phase tape whose slope is the rate
+    period = 3600.0 / 21600.0
+    k = np.arange(120)
+    t = 0.05 + k * period / (1 + 5.4 / 86400) + 0.35e-3 * np.where(k % 2 == 0, 0.5, -0.5)
+    win._append_measurement_beats(
+        TimingUpdate(
+            indices=k, samples=t * 48000.0, segments=np.zeros(120, int),
+            fs_eff=48000.0, nominal_period_s=period,
+        )
+    )  # fmt: skip
+    win._refresh_paper_tape()
+    x_even, y_even = win.tape_curve_even.getData()
+    x_odd, y_odd = win.tape_curve_odd.getData()
+    assert len(x_even) == len(x_odd) == 60
+    line_even = np.polyfit(x_even, y_even, 1)
+    line_odd = np.polyfit(x_odd, y_odd, 1)
+    assert line_even[0] == pytest.approx(-5.4 / 86.4, rel=1e-3)  # slope = rate
+    gap_ms = np.polyval(line_even, 10.0) - np.polyval(line_odd, 10.0)
+    assert gap_ms == pytest.approx(0.35, abs=1e-3)  # vertical gap between lines = beat error
+
+    # "Centrar Trazo" centers the Y axis on the phase trace
     win.center_paper_tape_trace()
     y_range = win.paper_tape_plot.viewRange()[1]
-    y_mid = 0.5 * (y_range[0] + y_range[1])
-    assert abs(y_mid - 5.4) < 0.5
+    all_y = np.r_[y_even, y_odd]
+    assert y_range[0] <= all_y.min() and all_y.max() <= y_range[1]
 
     # Verify "Guardar Posición" records DU and DD into Global Stats table (started empty)
     win.cmb_position.setCurrentText("DU")

@@ -42,8 +42,9 @@ def test_high_rate_curves_use_cheap_rendering(win) -> None:
         pen = curve.opts["pen"]
         assert pen.widthF() == pytest.approx(1.0)
         assert pen.isCosmetic() is True
-    # The low-rate paper tape keeps its styling
-    assert win.tape_curve_even.opts["pen"].widthF() == pytest.approx(1.8)
+    # The paper tape keeps its dot symbols (phase tape: one dot per beat)
+    assert win.tape_curve_even.opts["symbol"] == "o"
+    assert win.tape_curve_even.opts["antialias"] is True
 
 
 def test_waveform_frames_are_coalesced_to_latest(win) -> None:

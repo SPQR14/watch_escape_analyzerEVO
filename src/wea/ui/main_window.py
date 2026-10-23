@@ -346,10 +346,9 @@ class MainWin(QMainWindow):
         self._meas_segment: list[int] = []
         self._meas_fs: float = 48000.0
         self._meas_period_s: float = 0.0
-        self._tape_times_even: list[float] = []
-        self._tape_rate_even: list[float] = []
-        self._tape_times_odd: list[float] = []
-        self._tape_rate_odd: list[float] = []
+        # Windowed-rate overlay of the paper tape (x = session s, y = s/d)
+        self._tape_rate_x: list[float] = []
+        self._tape_rate_y: list[float] = []
         self._last_telemetry: TelemetryResult | None = None
         self._session_records: list[dict[str, float | str | int]] = []
         self._capture_start_monotonic: float | None = None
@@ -1122,28 +1121,29 @@ class MainWin(QMainWindow):
         self.paper_tape_plot = pg.PlotWidget()
         self.paper_tape_plot.showGrid(x=True, y=True, alpha=0.25)
         self.paper_tape_plot.setXRange(0.0, 30.0)
-        self.paper_tape_plot.setYRange(-10.0, 12.0)
+        self.paper_tape_plot.setYRange(-2.0, 2.0)
 
-        # Zero-deviation horizontal reference line
+        # Phase tape: y = t - n T - t0 (ms). A watch at exactly 0 s/d draws a horizontal line,
+        # the slope is the rate and the distance between the tick and tock lines is the beat
+        # error. Reference lines through the first beat show the slopes of 0, -4 and +6 s/d.
         self.tape_zero_line = pg.InfiniteLine(
-            pos=0.0,
+            pos=(0.0, 0.0),
             angle=0,
             pen=pg.mkPen(color="#3b4659", width=1.2, style=Qt.PenStyle.DashLine),
         )
         self.paper_tape_plot.addItem(self.tape_zero_line)
 
-        # Static horizontal translucent green COSC limit lines (-4 and +6) on Y-axis
         cosc_pen = pg.mkPen(color=(0, 230, 118, 135), width=1.8, style=Qt.PenStyle.DashLine)
         self.cosc_lower_line = pg.InfiniteLine(
-            pos=self.COSC_MIN_SPD,
-            angle=0,
+            pos=(0.0, 0.0),
+            angle=self.rate_slope_angle_deg(self.COSC_MIN_SPD),
             pen=cosc_pen,
             label="-4",
             labelOpts={"position": 0.97, "color": (0, 230, 118, 220)},
         )
         self.cosc_upper_line = pg.InfiniteLine(
-            pos=self.COSC_MAX_SPD,
-            angle=0,
+            pos=(0.0, 0.0),
+            angle=self.rate_slope_angle_deg(self.COSC_MAX_SPD),
             pen=cosc_pen,
             label="+6",
             labelOpts={"position": 0.97, "color": (0, 230, 118, 220)},
@@ -1151,13 +1151,13 @@ class MainWin(QMainWindow):
         self.paper_tape_plot.addItem(self.cosc_lower_line)
         self.paper_tape_plot.addItem(self.cosc_upper_line)
 
-        # Two parallel traces (even/odd beats) using circular point symbols ('o')
+        # Tick (even n) and tock (odd n) beats as separate series
         self.tape_curve_even = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#00e5ff", width=1.8),
+            pen=pg.mkPen(color="#00e5ff", width=1.0),
             symbol="o",
-            symbolSize=5,
+            symbolSize=4,
             symbolBrush="#00e5ff",
             symbolPen=None,
             name="Tick (Even)",
@@ -1165,13 +1165,31 @@ class MainWin(QMainWindow):
         self.tape_curve_odd = self.paper_tape_plot.plot(
             [],
             [],
-            pen=pg.mkPen(color="#ffab00", width=1.8),
+            pen=pg.mkPen(color="#ffab00", width=1.0),
             symbol="o",
-            symbolSize=5,
+            symbolSize=4,
             symbolBrush="#ffab00",
             symbolPen=None,
             name="Tock (Odd)",
         )
+
+        # Optional overlay: windowed regression rate on a right-hand s/d axis
+        tape_item = self.paper_tape_plot.getPlotItem()
+        self.tape_rate_view = pg.ViewBox()
+        tape_item.scene().addItem(self.tape_rate_view)
+        tape_item.getAxis("right").linkToView(self.tape_rate_view)
+        self.tape_rate_view.setXLink(tape_item)
+        self.tape_rate_curve = pg.PlotDataItem(
+            [], [], pen=pg.mkPen(color="#e040fb", width=1.5), name="Rate (window)"
+        )
+        self.tape_rate_view.addItem(self.tape_rate_curve)
+
+        def _sync_rate_view() -> None:
+            self.tape_rate_view.setGeometry(tape_item.vb.sceneBoundingRect())
+            self.tape_rate_view.linkedViewChanged(tape_item.vb, self.tape_rate_view.XAxis)
+
+        tape_item.vb.sigResized.connect(_sync_rate_view)
+        self._set_tape_rate_overlay_visible(False)
         center_layout.addWidget(self.paper_tape_plot, stretch=1)
 
         # Footer bar right beneath Paper Tape Trace with "Center Trace", "Export Traces", and "Print Traces"
@@ -1191,6 +1209,23 @@ class MainWin(QMainWindow):
         self.btn_print_traces.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_print_traces.clicked.connect(lambda: self.print_traces())
         tape_footer_layout.addWidget(self.btn_print_traces)
+
+        self.lbl_rate_window = QLabel()
+        self.lbl_rate_window.setObjectName("StatKey")
+        tape_footer_layout.insertWidget(0, self.lbl_rate_window)
+        self.spn_rate_window = QSpinBox()
+        self.spn_rate_window.setRange(5, 120)
+        self.spn_rate_window.setValue(15)
+        self.spn_rate_window.setSuffix(" s")
+        self.spn_rate_window.valueChanged.connect(self._on_rate_window_changed)
+        tape_footer_layout.insertWidget(1, self.spn_rate_window)
+
+        self.btn_tape_rate = QPushButton()
+        self.btn_tape_rate.setObjectName("CenterTraceButton")
+        self.btn_tape_rate.setCheckable(True)
+        self.btn_tape_rate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tape_rate.toggled.connect(self._set_tape_rate_overlay_visible)
+        tape_footer_layout.insertWidget(2, self.btn_tape_rate)
 
         self.btn_center_trace = QPushButton()
         self.btn_center_trace.setObjectName("CenterTraceButton")
@@ -1413,21 +1448,86 @@ class MainWin(QMainWindow):
         self.btn_global_stats.setText(f"{arrow} {self.translator.tr('btn_global_stats')}")
         logger.debug("Global statistics panel visibility set to %s", checked)
 
-    def center_paper_tape_trace(self) -> None:
-        """Auto-adjust the Paper Tape Y-axis range to center on current trace values."""
-        all_y = self._tape_rate_even + self._tape_rate_odd
-        if not all_y:
-            self.paper_tape_plot.setYRange(-10.0, 12.0)
-            logger.debug("Paper tape trace centered to default range [-10.0, 12.0]")
-            return
+    @staticmethod
+    def rate_slope_angle_deg(rate_spd: float) -> float:
+        """Angle (deg, data coordinates) of the phase-tape line of a watch at ``rate_spd``.
 
-        y_min = float(min(all_y))
-        y_max = float(max(all_y))
+        Phase ``t - n T`` changes by ``-rate / 86400`` s per second, i.e.
+        ``-rate / 86.4`` ms per second: a gaining watch drifts downwards.
+        """
+        return float(np.degrees(np.arctan(-rate_spd / 86.4)))
+
+    def _set_tape_rate_overlay_visible(self, visible: bool) -> None:
+        """Show or hide the windowed-rate series and its right-hand s/d axis."""
+        self.tape_rate_curve.setVisible(bool(visible))
+        item = self.paper_tape_plot.getPlotItem()
+        item.showAxis("right", bool(visible))
+        if visible:
+            item.getAxis("right").setLabel("s/d")
+            self.tape_rate_view.enableAutoRange(axis="y")
+
+    def _on_rate_window_changed(self, seconds: int) -> None:
+        """Forward the regression window length to the DSP worker."""
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            self.dsp_worker.set_rate_window_s(float(seconds))
+
+    def tape_phase_series(self) -> dict[str, np.ndarray]:
+        """Phase-tape points of the measured beats.
+
+        ``x = t - t0`` (s) and ``y = t - n T - t0`` (ms) per continuous segment; a new segment
+        (audio gap of unknown length) continues from the last phase of the previous one and
+        is not connected to it.
+
+        Returns:
+            Dict with ``x``, ``y`` (all beats), ``even`` / ``odd`` boolean masks and
+            ``connect`` (True where a point joins the next one of its series).
+        """
+        if not self._meas_sample:
+            empty = np.empty(0)
+            return {"x": empty, "y": empty, "even": empty.astype(bool), "odd": empty.astype(bool)}
+        t = np.asarray(self._meas_sample) / self._meas_fs
+        n = np.asarray(self._meas_index)
+        seg = np.asarray(self._meas_segment)
+        period = self._meas_period_s
+        y = np.empty(len(t))
+        carry = 0.0
+        for s in dict.fromkeys(seg.tolist()):
+            m = seg == s
+            ts, ns = t[m], n[m]
+            phase = (ts - ts[0]) - (ns - ns[0]) * period
+            y[m] = (phase + carry) * 1000.0
+            carry += float(phase[-1])
+        return {"x": t - t[0], "y": y, "even": n % 2 == 0, "odd": n % 2 == 1, "seg": seg}
+
+    def _refresh_paper_tape(self) -> None:
+        """Redraw tick/tock phase series from the measured beats."""
+        tape = self.tape_phase_series()
+        for curve, key in ((self.tape_curve_even, "even"), (self.tape_curve_odd, "odd")):
+            mask = tape[key]
+            x, y = tape["x"][mask], tape["y"][mask]
+            if len(x) >= 2:
+                seg = tape["seg"][mask]
+                connect = np.r_[seg[1:] == seg[:-1], False]
+                curve.setData(x, y, connect=connect)
+            else:
+                curve.setData(x, y)
+        if len(self._tape_rate_x):
+            self.tape_rate_curve.setData(self._tape_rate_x, self._tape_rate_y)
+
+    def center_paper_tape_trace(self) -> None:
+        """Auto-adjust the Paper Tape Y-axis range to center on the phase trace."""
+        y = self.tape_phase_series()["y"]
+        if len(y) == 0:
+            self.paper_tape_plot.setYRange(-2.0, 2.0)
+            logger.debug("Paper tape trace centered to default range [-2.0, 2.0] ms")
+            return
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
         y_center = 0.5 * (y_min + y_max)
-        half_span = max(3.5, 0.75 * (y_max - y_min) + 2.0)
+        half_span = max(0.5, 0.6 * (y_max - y_min))
         self.paper_tape_plot.setYRange(y_center - half_span, y_center + half_span)
         logger.info(
-            "Paper tape trace centered around %.2f s/d (range [%.2f, %.2f])",
+            "Paper tape trace centered around %.3f ms (range [%.3f, %.3f])",
             y_center,
             y_center - half_span,
             y_center + half_span,
@@ -1982,6 +2082,8 @@ class MainWin(QMainWindow):
         self.btn_export_traces.setText(tr("btn_export_traces"))
         self.btn_print_traces.setText(tr("btn_print_traces"))
         self.btn_center_trace.setText(tr("btn_center_trace"))
+        self.btn_tape_rate.setText(tr("btn_tape_rate"))
+        self.lbl_rate_window.setText(tr("rate_window"))
         self.btn_record.setText(f"● {tr('btn_record_audio').upper()}")
         self.btn_start.setText(tr("btn_start"))
         self.btn_stop.setText(tr("btn_stop"))
@@ -2049,10 +2151,9 @@ class MainWin(QMainWindow):
         self._meas_segment.clear()
         self._meas_period_s = 0.0
         self._session_records.clear()
-        self._tape_times_even.clear()
-        self._tape_rate_even.clear()
-        self._tape_times_odd.clear()
-        self._tape_rate_odd.clear()
+        self._tape_rate_x.clear()
+        self._tape_rate_y.clear()
+        self.tape_rate_curve.setData([], [])
         self._recorded_audio = None
         self._capture_start_monotonic = time.monotonic()
 
@@ -2191,16 +2292,7 @@ class MainWin(QMainWindow):
             self.lbl_stat_delta_val.setText(f"{r_delta:.2f} s/d")
             self.lbl_stat_mean_val.setText(f"{r_mean:+.2f} s/d")
 
-            # Horizontal Paper Tape: X = Elapsed Time (s), Y = Deviation/Rate (s/d)
-            # Separate even/odd tracks visually by beat error asymmetry
-            half_be_offset = 0.5 * telemetry.beat_error_ms
-            self._tape_times_even.append(t_meas)
-            self._tape_rate_even.append(telemetry.rate_spd - half_be_offset)
-            self._tape_times_odd.append(t_meas)
-            self._tape_rate_odd.append(telemetry.rate_spd + half_be_offset)
-
-            self.tape_curve_even.setData(self._tape_times_even, self._tape_rate_even)
-            self.tape_curve_odd.setData(self._tape_times_odd, self._tape_rate_odd)
+            # The paper tape is drawn from real beat timestamps only (_on_telemetry_ready)
 
         # Update Bottom-Left Oscilloscope and Bottom-Right Audio Waveform
         fs = self.current_watch_config().sample_rate
@@ -2346,15 +2438,12 @@ class MainWin(QMainWindow):
             )
 
             self._update_rate_statistics()
-
-            half_be_offset = 0.5 * beat_error_ms
-            self._tape_times_even.append(t_meas)
-            self._tape_rate_even.append(rate_spd - half_be_offset)
-            self._tape_times_odd.append(t_meas)
-            self._tape_rate_odd.append(rate_spd + half_be_offset)
-
-            self.tape_curve_even.setData(self._tape_times_even, self._tape_rate_even)
-            self.tape_curve_odd.setData(self._tape_times_odd, self._tape_rate_odd)
+            if timing is not None and self._meas_sample:
+                t_first = self._meas_sample[0] / self._meas_fs
+                self._tape_rate_x.append(timing.session_s - t_first)
+                self._tape_rate_y.append(rate_spd)
+        if should_record_tape and timing is not None:
+            self._refresh_paper_tape()
 
         if isinstance(telemetry, BeatTelemetry):
             fs = float(
