@@ -46,3 +46,8 @@ datasets/
 *.log
 logs/
 *logs/
+
+# Diagnostic captures (scripts/diagnose_beats.py); audio is large and reproducible
+diagnostics/
+tests/data/**/audio.npy
+tests/data/**/audio.wav

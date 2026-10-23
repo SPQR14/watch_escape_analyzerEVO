@@ -187,3 +187,102 @@ class SyntheticEscapeGenerator:
 
         buffer[base_idx : base_idx + k_len] += (1.0 - frac) * kernel
         buffer[base_idx + 1 : base_idx + k_len + 1] += frac * kernel
+
+
+def synthesize_escapement(
+    bph: int = 21600,
+    rate_spd: float = 5.0,
+    beat_error_ms: float = 0.3,
+    amplitude_deg: float = 290.0,
+    lift_angle: float = 51.0,
+    seconds: float = 30.0,
+    fs: int = 48000,
+    snr_db: float = 25.0,
+    carrier_hz: float = 6000.0,
+    second_mode_ratio: float = 1.32,
+    sound_levels: tuple[float, float, float] = (0.45, 0.35, 1.0),
+    decay_s: float = 0.0006,
+    jitter_us: float = 5.0,
+    missing_fraction: float = 0.0,
+    hum_level: float = 0.3,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Synthesize a contact-microphone escapement recording with a resonant carrier.
+
+    Each beat has three sounds - unlock P1 at the beat instant, impulse P2 at ``0.45 t_lift``
+    and drop P3 at ``t_lift`` - with ``t_lift = arcsin(LA / (2 A)) / (pi f_osc)``. Each sound
+    is a two-mode damped burst (``carrier_hz`` and ``second_mode_ratio * carrier_hz``) with a
+    0.1 ms attack and random phases, so the envelope ripple differs from beat to beat, as with
+    a real case resonance. Beat instants follow ``t_k = t_0 + k P +- d / 2`` (beat error ``d``)
+    plus Gaussian jitter.
+
+    Args:
+        bph: Beats per hour.
+        rate_spd: True rate in s/d (positive = gains, i.e. shorter period).
+        beat_error_ms: True beat error ``d`` (intervals alternate ``P + d`` / ``P - d``).
+        amplitude_deg: Balance amplitude.
+        lift_angle: Lift angle in degrees.
+        seconds: Duration.
+        fs: Sample rate in Hz.
+        snr_db: Burst RMS to white-noise RMS ratio.
+        carrier_hz: Main resonance of the escapement sounds.
+        second_mode_ratio: Frequency ratio of the second resonance.
+        sound_levels: Relative peak levels of P1, P2, P3.
+        decay_s: Exponential decay time constant of each sound.
+        jitter_us: Standard deviation of the per-beat timing jitter.
+        missing_fraction: Fraction of beats removed at random (dropouts).
+        hum_level: 50 Hz hum level relative to the burst RMS.
+        seed: Random seed.
+
+    Returns:
+        ``(signal, onsets_s)`` - the audio and the true P1 instant of every present beat.
+    """
+    rng = np.random.default_rng(seed)
+    period_s = 3600.0 / bph / (1.0 + rate_spd / 86400.0)
+    f_osc = bph / 7200.0
+    t_lift = float(np.arcsin(lift_angle / (2.0 * amplitude_deg)) / (np.pi * f_osc))
+
+    n_total = int(round(seconds * fs))
+    x = np.zeros(n_total + fs, dtype=np.float64)
+    burst_len = int(round(8.0 * decay_s * fs)) + 1
+    t_b = np.arange(burst_len, dtype=np.float64) / fs
+    attack = 1.0 - np.exp(-t_b / 1e-4)
+    decay = np.exp(-t_b / decay_s)
+
+    onsets: list[float] = []
+    n_beats = int((seconds - 0.1) / period_s)
+    for k in range(n_beats):
+        t0 = 0.05 + k * period_s + 0.5 * beat_error_ms * 1e-3 * (1.0 if k % 2 == 0 else -1.0)
+        t0 += rng.normal(0.0, jitter_us * 1e-6)
+        if missing_fraction > 0.0 and rng.random() < missing_fraction:
+            continue
+        if t0 + t_lift + burst_len / fs >= seconds:
+            break
+        onsets.append(t0)
+        for frac, level in zip((0.0, 0.45, 1.0), sound_levels):
+            ph1, ph2 = rng.uniform(0.0, 2.0 * np.pi, size=2)
+            burst = (
+                level
+                * attack
+                * decay
+                * (
+                    np.sin(2.0 * np.pi * carrier_hz * t_b + ph1)
+                    + 0.6 * np.sin(2.0 * np.pi * second_mode_ratio * carrier_hz * t_b + ph2)
+                )
+            )
+            pos = (t0 + frac * t_lift) * fs
+            i0 = int(np.floor(pos))
+            w = pos - i0
+            x[i0 : i0 + burst_len] += (1.0 - w) * burst
+            x[i0 + 1 : i0 + burst_len + 1] += w * burst
+
+    x = x[:n_total]
+    active = x[np.abs(x) > 1e-9]
+    rms = float(np.sqrt(np.mean(active**2))) if active.size else 1.0
+    t_all = np.arange(n_total, dtype=np.float64) / fs
+    noisy = (
+        x
+        + rng.normal(0.0, rms / (10.0 ** (snr_db / 20.0)), n_total)
+        + hum_level * rms * np.sin(2.0 * np.pi * 50.0 * t_all)
+    )
+    return noisy, np.asarray(onsets, dtype=np.float64)
