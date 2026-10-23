@@ -214,10 +214,13 @@ def test_main_window_dsp_worker_integration_and_clean_shutdown() -> None:
         assert win.card_beat_error.value_label.text() != "---.-"
         assert win.card_amplitude.value_label.text() != "---.-"
 
-        # Verify SNR gauge is populated (> 0 dB and > 0%)
-        assert win.prg_snr.value() > 50
-        assert "0.0 dB (0%)" not in win.lbl_snr_value.text()
-        assert "dB (" in win.lbl_snr_value.text()
+        # SNR gauge: one definition, label and bar show the same dB value
+        snr_text = win.lbl_snr_value.text()
+        assert snr_text.endswith(" dB") and "%" not in snr_text
+        snr_value = float(snr_text.split()[0])
+        assert snr_value > 20.0
+        assert win.prg_snr.value() == min(round(snr_value), win.SNR_BAR_FULL_SCALE_DB)
+        assert win.prg_snr.format() == f"{snr_value:.0f} dB"
 
         # Verify Paper Tape trace curves
         x_even, y_even = win.tape_curve_even.getData()

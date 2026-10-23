@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from wea.core.clock_calibration import CalibrationResult
 from wea.core.dsp_pipeline import EscapeDSPPipeline
 from wea.core.models import BeatEvent, BeatTelemetry, TelemetryResult, TimingUpdate, WatchConfig
 from wea.core.rate_regression import RateFit, fit_rate_be
@@ -394,6 +395,7 @@ class MainWin(QMainWindow):
         self.dsp_worker.drift_updated.connect(self._on_drift_updated)
         self.dsp_worker.error_occurred.connect(self._on_worker_error)
         self.dsp_worker.session_finished.connect(self._on_session_finished)
+        self.dsp_worker.calibration_measured.connect(self._on_calibration_measured)
         self.dsp_thread.start()
 
         # Wire UI controls to update DSPStreamWorker configuration in real time
@@ -943,8 +945,9 @@ class MainWin(QMainWindow):
         snr_header.addWidget(self.lbl_snr_value)
 
         self.prg_snr = QProgressBar()
-        self.prg_snr.setRange(0, 100)
+        self.prg_snr.setRange(0, self.SNR_BAR_FULL_SCALE_DB)
         self.prg_snr.setValue(0)
+        self.prg_snr.setFormat("-- dB")
 
         snr_layout.addLayout(snr_header)
         snr_layout.addWidget(self.prg_snr)
@@ -1354,6 +1357,8 @@ class MainWin(QMainWindow):
         # Status bar with live clock drift telemetry indicator
         self.lbl_drift_status = QLabel()
         self.lbl_drift_status.setObjectName("StatValue")
+        self._build_calibration_bar()
+        self.statusBar().addPermanentWidget(self.cal_panel)
         self.statusBar().addPermanentWidget(self.lbl_drift_status)
 
     def _populate_audio_devices(self) -> list[AudioDeviceInfo]:
@@ -2051,6 +2056,10 @@ class MainWin(QMainWindow):
         self.card_amplitude.set_title(tr("amplitude"))
 
         self.lbl_signal_quality.setText(tr("signal_quality").upper())
+        self.lbl_cal_title.setText(tr("cal_title") + ":")
+        self.btn_cal_measure.setText(tr("cal_measure"))
+        for i, key in enumerate(self.CALIBRATION_REFERENCES):
+            self.cmb_cal_ref.setItemText(i, tr(key))
         self.lbl_stats_title.setText(tr("statistics").upper())
 
         self.lbl_stat_max_key.setText(f"{tr('stat_max')}:")
@@ -2249,9 +2258,7 @@ class MainWin(QMainWindow):
         self.lbl_stat_elapsed_val.setText(f"{mins:02d}:{secs:04.1f}")
 
         # Update Signal Quality / SNR bar
-        quality_pct = int(np.clip((snr_db / 50.0) * 100.0 * telemetry.confidence, 0.0, 100.0))
-        self.prg_snr.setValue(quality_pct)
-        self.lbl_snr_value.setText(f"{snr_db:.1f} dB ({int(telemetry.confidence * 100)}%)")
+        self._show_snr(snr_db)
 
         # Update HUD Cards
         sign_str = "+" if telemetry.rate_spd >= 0 else ""
@@ -2400,11 +2407,7 @@ class MainWin(QMainWindow):
         self.lbl_stat_elapsed_val.setText(f"{mins:02d}:{secs:04.1f}")
 
         raw_snr_db = float(getattr(telemetry, "snr_db", 0.0))
-        if raw_snr_db <= 0.0 and confidence > 0.0:
-            raw_snr_db = 38.0 * confidence
-        quality_pct = int(round(np.clip((raw_snr_db / 45.0) * 100.0 * confidence, 0.0, 100.0)))
-        self.prg_snr.setValue(quality_pct)
-        self.lbl_snr_value.setText(f"{raw_snr_db:.1f} dB ({quality_pct}%)")
+        self._show_snr(raw_snr_db)
 
         timing = getattr(telemetry, "timing", None)
         rate_valid = bool(getattr(telemetry, "rate_valid", True))
@@ -2539,6 +2542,101 @@ class MainWin(QMainWindow):
             self.stop_capture()
 
     WAVEFORM_MIN_INTERVAL_S: float = 1.0 / 30.0
+
+    SNR_BAR_FULL_SCALE_DB: int = 40
+    # Display key -> (method, reference); the keys are translated in retranslate_ui
+    CALIBRATION_REFERENCES: dict[str, tuple[str, float]] = {
+        "cal_ref_tone6": ("tone", 6.0),
+        "cal_ref_pulses6": ("ticks", 1.0 / 6.0),
+        "cal_ref_quartz1": ("ticks", 1.0),
+    }
+
+    def _build_calibration_bar(self) -> None:
+        """Compact sound-card clock calibration controls for the status bar.
+
+        Manual ppm entry, or a measurement against a reference (tone / pulses / quartz) on
+        the live input. Lives next to the clock-drift readout; the left column has no
+        vertical room left.
+        """
+        self.cal_panel = QWidget()
+        row = QHBoxLayout(self.cal_panel)
+        row.setContentsMargins(0, 0, 12, 0)
+        row.setSpacing(6)
+        self.lbl_cal_title = QLabel()
+        self.lbl_cal_title.setObjectName("StatKey")
+        self.spn_cal_ppm = QDoubleSpinBox()
+        self.spn_cal_ppm.setRange(-500.0, 500.0)
+        self.spn_cal_ppm.setDecimals(2)
+        self.spn_cal_ppm.setSingleStep(0.1)
+        self.spn_cal_ppm.setSuffix(" ppm")
+        self.spn_cal_ppm.setMinimumWidth(110)
+        self.spn_cal_ppm.valueChanged.connect(self._on_calibration_ppm_changed)
+        self.cmb_cal_ref = QComboBox()
+        for key, ref in self.CALIBRATION_REFERENCES.items():
+            self.cmb_cal_ref.addItem(key, ref)
+        self._configure_combo_box(self.cmb_cal_ref, min_width=110)
+        self.spn_cal_seconds = QSpinBox()
+        self.spn_cal_seconds.setRange(10, 900)
+        self.spn_cal_seconds.setValue(60)
+        self.spn_cal_seconds.setSuffix(" s")
+        self.btn_cal_measure = QPushButton()
+        self.btn_cal_measure.setObjectName("CenterTraceButton")
+        self.btn_cal_measure.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cal_measure.clicked.connect(self.start_clock_calibration)
+        self.lbl_cal_result = QLabel("")
+        self.lbl_cal_result.setObjectName("StatValue")
+        self.lbl_cal_ppm = self.lbl_cal_title  # single caption in the compact bar
+        for widget in (
+            self.lbl_cal_title,
+            self.spn_cal_ppm,
+            self.cmb_cal_ref,
+            self.spn_cal_seconds,
+            self.btn_cal_measure,
+            self.lbl_cal_result,
+        ):
+            row.addWidget(widget)
+
+    def _on_calibration_ppm_changed(self, ppm: float) -> None:
+        """Apply the sound-card clock correction to every calculation (via effective fs)."""
+        if hasattr(self, "dsp_worker") and self.dsp_worker is not None:
+            self.dsp_worker.set_calibration_ppm(float(ppm))
+
+    def start_clock_calibration(self) -> bool:
+        """Measure the card clock against the selected reference on the live input."""
+        tr = self.translator.tr
+        if (
+            self.dsp_worker is None
+            or not self.dsp_worker.isRunning()
+            or self.dsp_worker.synthetic_mode
+        ):
+            self.lbl_cal_result.setText(tr("cal_need_capture"))
+            return False
+        method, reference = self.cmb_cal_ref.currentData()
+        self.dsp_worker.start_calibration(
+            method, seconds=float(self.spn_cal_seconds.value()), reference=float(reference)
+        )
+        self.lbl_cal_result.setText(tr("cal_measuring"))
+        return True
+
+    def _on_calibration_measured(self, result: object) -> None:
+        """Show (and apply) a finished clock calibration."""
+        if isinstance(result, CalibrationResult):
+            self.spn_cal_ppm.setValue(result.ppm)
+            self.lbl_cal_result.setText(f"{result.ppm:+.2f} ± {result.sigma_ppm:.2f} ppm")
+        else:
+            self.lbl_cal_result.setText(self.translator.tr("cal_failed"))
+            logger.warning("Clock calibration failed: %s", result)
+
+    def _show_snr(self, snr_db: float) -> None:
+        """Show the beat SNR (``wea.core.beat_timing.beat_snr_db``) as number and bar.
+
+        Both display the same quantity: the bar spans 0-40 dB and its text is the dB value,
+        so there is no second, differently defined percentage.
+        """
+        value = float(np.clip(snr_db, 0.0, 60.0))
+        self.prg_snr.setValue(int(round(min(value, self.SNR_BAR_FULL_SCALE_DB))))
+        self.prg_snr.setFormat(f"{value:.0f} dB")
+        self.lbl_snr_value.setText(f"{value:.1f} dB")
 
     def _append_measurement_beats(self, timing: TimingUpdate) -> None:
         """Accumulate the beats measured after stabilization (session regression, tape)."""

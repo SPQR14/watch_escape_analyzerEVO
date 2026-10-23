@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 from scipy.ndimage import maximum_filter1d
 from scipy.signal import butter, hilbert, oaconvolve, sosfilt, sosfilt_zi, sosfiltfilt
 
+from wea.core.beat_timing import beat_snr_db
 from wea.core.clock_drift import SampleRateDriftEstimator
 from wea.core.models import BeatEvent, BeatTelemetry, WatchConfig
 from wea.utils.logger_setup import LoggerSetup
@@ -1076,11 +1077,17 @@ class DSPEngine:
         else:
             confidence = base_confidence
 
-        # Acoustic SNR (dB): ratio of peak beat envelope amplitude to median noise floor
-        peak_env = float(np.median([np.sqrt(max(b.peak_energy, 0.0)) for b in beats]))
-        noise_floor = float(np.median(macro_env)) + 1e-12
-        snr_db = float(
-            np.clip(20.0 * np.log10(max(peak_env, noise_floor) / noise_floor), 0.0, 60.0)
+        # SNR: the single app-wide definition (wea.core.beat_timing.beat_snr_db): median beat
+        # envelope peak over the median envelope of the 20 ms before each beat window.
+        noise_win = max(1, int(round(0.020 * fs_eff)))
+        pre_noise = []
+        for b in beats:
+            w0 = int(round(b.timestamp_p1 * fs_eff)) - half_window
+            if w0 - noise_win >= 0:
+                pre_noise.append(float(np.median(micro_env[w0 - noise_win : w0])))
+        snr_db = beat_snr_db(
+            [np.sqrt(max(b.peak_energy, 0.0)) for b in beats],
+            pre_noise if pre_noise else [float(np.median(micro_env))],
         )
 
         telemetry = BeatTelemetry(

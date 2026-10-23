@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from wea.core.beat_timing import OnsetBeatTracker, OnsetConfig, beat_snr_db
+from wea.core.clock_calibration import measure_ppm_from_ticks, measure_ppm_from_tone
 from wea.core.clock_drift import AtomicNTPDiscipline, SampleRateDriftEstimator
 from wea.core.dsp_engine import DSPEngine
 from wea.core.models import BeatTelemetry, TimingUpdate, WatchConfig
@@ -37,6 +38,8 @@ class DSPStreamWorker(QObject):
     waveform_ready = pyqtSignal(object, object)
     drift_updated = pyqtSignal(float, float, float)
     error_occurred = pyqtSignal(str)
+    # CalibrationResult on success, str message on failure
+    calibration_measured = pyqtSignal(object)
     session_finished = pyqtSignal()
 
     _sig_start_timer = pyqtSignal(int)
@@ -152,6 +155,9 @@ class DSPStreamWorker(QObject):
         self.rate_window_s: float = max(3.0, float(rate_window_s))
         self.onset_config: OnsetConfig = onset_config if onset_config is not None else OnsetConfig()
         self._timing_lock = threading.Lock()
+        self._cal_request: tuple[str, float, float, float] | None = None
+        self._cal_chunks: list[NDArray[np.float64]] = []
+        self._cal_samples: int = 0
         self._reset_timing()
 
         self._window_samples: int = 0
@@ -786,11 +792,13 @@ class DSPStreamWorker(QObject):
                 )
             start, samples = self.ring_buffer.read_since(self._rb_pos)
             disc = self.discontinuity_count != self._timing_disc_seen
-            if disc or start != self._rb_pos:
+            gap = disc or start != self._rb_pos
+            if gap:
                 self._timing_disc_seen = self.discontinuity_count
                 self._session_offset = self.beat_tracker.next_sample - start
                 self.beat_tracker.mark_discontinuity(start + self._session_offset)
             self._rb_pos = start + len(samples)
+            self._feed_calibration(samples, restart=gap)
             onsets = self.beat_tracker.process(samples, start_sample=start + self._session_offset)
             self.rate_estimator.add(onsets)
             fit = self.rate_estimator.fit(effective_fs)
@@ -806,6 +814,93 @@ class DSPStreamWorker(QObject):
                 snr_db=beat_snr_db(peaks, noises),
                 session_s=self.beat_tracker.next_sample / float(effective_fs),
             )
+
+    def start_calibration(
+        self,
+        method: str,
+        seconds: float = 60.0,
+        reference: float = 6.0,
+        reference_rate_spd: float = 0.0,
+    ) -> None:
+        """Measure the sound-card clock error against a reference on the live input.
+
+        The next ``seconds`` of captured audio are collected on the analysis thread and the
+        result (``CalibrationResult``) or an error message is emitted via
+        ``calibration_measured``. It is not applied automatically.
+
+        Args:
+            method: ``"tone"`` (``reference`` = tone frequency in Hz) or ``"ticks"``
+                (``reference`` = tick period in s: 1.0 for a quartz watch, 1/6 for 6 Hz).
+            seconds: Audio to collect (longer -> smaller uncertainty).
+            reference: Tone frequency (Hz) or tick period (s).
+            reference_rate_spd: Known rate of a tick reference (quartz watch), s/d.
+        """
+        if method not in ("tone", "ticks"):
+            raise ValueError(f"Unknown calibration method {method!r}")
+        with self._timing_lock:
+            self._cal_request = (
+                method,
+                float(seconds),
+                float(reference),
+                float(reference_rate_spd),
+            )
+            self._cal_chunks = []
+            self._cal_samples = 0
+        logger.info(
+            "Clock calibration started (%s, %.0f s, reference %.6g)", method, seconds, reference
+        )
+
+    def cancel_calibration(self) -> None:
+        """Abort a running calibration measurement."""
+        with self._timing_lock:
+            self._cal_request = None
+            self._cal_chunks = []
+            self._cal_samples = 0
+
+    @property
+    def calibration_progress(self) -> float:
+        """Fraction (0-1) of the requested calibration audio collected, 0 when idle."""
+        req = self._cal_request
+        if req is None:
+            return 0.0
+        return min(1.0, self._cal_samples / (req[1] * float(self.config.sample_rate)))
+
+    def _feed_calibration(self, samples: NDArray[np.float64], restart: bool) -> None:
+        """Collect calibration audio (caller holds ``_timing_lock``); finish when complete."""
+        req = self._cal_request
+        if req is None or len(samples) == 0:
+            return
+        if restart:
+            # A gap in the audio breaks the time base of the measurement: start over
+            self._cal_chunks = []
+            self._cal_samples = 0
+        self._cal_chunks.append(np.asarray(samples, dtype=np.float64).copy())
+        self._cal_samples += len(samples)
+        fs = float(self.config.sample_rate)
+        if self._cal_samples < req[1] * fs:
+            return
+        audio = np.concatenate(self._cal_chunks)
+        self._cal_request, self._cal_chunks, self._cal_samples = None, [], 0
+        method, _, reference, ref_rate = req
+        try:
+            if method == "tone":
+                result = measure_ppm_from_tone(audio, fs, tone_hz=reference)
+            else:
+                result = measure_ppm_from_ticks(
+                    audio, fs, period_s=reference, reference_rate_spd=ref_rate
+                )
+        except Exception as exc:
+            logger.warning("Clock calibration failed: %s", exc)
+            self.calibration_measured.emit(str(exc))
+            return
+        logger.info(
+            "Clock calibration measured %+.3f +- %.3f ppm (%s, %.0f s)",
+            result.ppm,
+            result.sigma_ppm,
+            result.method,
+            result.duration_s,
+        )
+        self.calibration_measured.emit(result)
 
     def _run_analysis(
         self,
