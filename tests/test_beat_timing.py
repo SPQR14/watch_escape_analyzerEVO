@@ -138,3 +138,20 @@ def test_onsets_carry_snr_inputs(clean_case) -> None:
     beats = detect_onsets(x, FS, BPH, 51.0)
     snr = beat_snr_db([b.peak for b in beats], [b.noise for b in beats])
     assert 15.0 < snr < 60.0
+
+
+def test_never_locks_on_noise_when_first_beats_are_missing() -> None:
+    """Regression: with beat 0 missing the 1-period acquisition window held only noise
+    (8 dB peaks) and the tracker locked mid-cycle forever (+160 s/d)."""
+    x, truth = synthesize_escapement(seconds=30.0, snr_db=20.0, rate_spd=-20.0, seed=9)
+    x = x.copy()
+    rng = np.random.default_rng(3)
+    holes = [0, 7, 15] + [k for k in range(16, len(truth)) if rng.random() < 0.12]
+    for k in holes:
+        a = int((truth[k] - 0.004) * FS)
+        x[a : a + int(0.030 * FS)] = rng.normal(0.0, 1e-4, int(0.030 * FS))  # quieter hole
+    present = np.delete(truth, holes)
+    beats = detect_onsets(x, FS, BPH, 51.0)
+    err = _match_errors_us(_times(beats), present)
+    assert len(beats) >= len(present) - 2
+    assert np.max(np.abs(err - np.median(err))) < 300.0

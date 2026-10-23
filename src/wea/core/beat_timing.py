@@ -56,6 +56,11 @@ class OnsetConfig:
     min_peak_ratio: float = 0.35
     # Consecutive gate misses before the lock is dropped and the beat re-acquired
     max_consecutive_misses: int = 12
+    # Acquisition (no lock yet) is stricter: the maximum of plain noise over a search window
+    # sits 8-10 dB above its median, so locking needs a clearly stronger peak...
+    acquire_min_snr_db: float = 13.0
+    # ...and a fresh lock is provisional: dropped if its first gated beats all miss
+    provisional_misses: int = 2
     # Envelope positions closer than this to a buffer end are not trusted
     edge_margin_ms: float = 30.0
     # Decay tail of the sound appended after the lift window when looking for the peak
@@ -106,6 +111,7 @@ def beat_snr_db(
 @dataclass
 class _TrackState:
     locked: bool = False
+    confirmed: bool = False
     misses: int = 0
     next_index: int = 0
     cursor: float = 0.0  # acquisition scan position (absolute samples)
@@ -247,6 +253,7 @@ class OnsetBeatTracker:
         gate_lo: float,
         gate_hi: float,
         peak_hi: float,
+        min_snr_db: float | None = None,
     ) -> tuple[float, float, float] | None:
         """Find the onset in ``[gate_lo, gate_hi]`` (absolute samples) for the beat whose peak
         lies in ``[gate_lo, peak_hi]``; returns ``(onset, peak, noise)`` or ``None``."""
@@ -260,7 +267,8 @@ class OnsetBeatTracker:
         pk = lo + int(np.argmax(env[lo:ph]))
         peak = float(env[pk])
         noise = float(np.median(env[lo - nw : lo]))
-        if peak <= noise * 10.0 ** (self.config.min_snr_db / 20.0):
+        snr_db = self.config.min_snr_db if min_snr_db is None else min_snr_db
+        if peak <= noise * 10.0 ** (snr_db / 20.0):
             return None
         recent = self._state.recent_peaks
         if len(recent) >= 3 and peak < self.config.min_peak_ratio * float(np.median(recent)):
@@ -325,24 +333,50 @@ class OnsetBeatTracker:
                 if res is not None:
                     beat = BeatOnset(m, res[0], res[1], res[2], self.segment)
                     self._accept(beat)
+                    st.confirmed = True
                     out.append(beat)
                 else:
                     st.misses += 1
-                    if st.misses > cfg.max_consecutive_misses:
+                    limit = cfg.max_consecutive_misses if st.confirmed else cfg.provisional_misses
+                    if st.misses >= limit:
                         st.locked = False
                         st.cursor = gate_hi
                         logger.debug("Onset tracker lost lock at beat %d; re-acquiring", m)
             else:
                 start = max(st.cursor, valid_start + nw + lift + tail)
-                stop = start + period
+                # Two periods always contain a beat even if one is missing
+                stop = start + 2.0 * period
                 if stop + 2.0 * (lift + tail) > valid_end:
                     break
                 i0 = int(start) - self._buf_start
                 i1 = int(stop) - self._buf_start
                 pk_abs = self._buf_start + i0 + int(np.argmax(env[i0:i1]))
-                res = self._measure(env, pk_abs - lift - tail, pk_abs, pk_abs + lift + tail)
+                res = self._measure(
+                    env, pk_abs - lift - tail, pk_abs, pk_abs + lift + tail, cfg.acquire_min_snr_db
+                )
+                # Prefer the earliest valid beat (step back one period from the strongest) as
+                # long as its noise window has data and it was not emitted already
+                tol = cfg.acquisition_gate_frac * period
+                min_onset = st.history[-1].sample + 0.5 * period if st.history else -np.inf
+                while res is not None:
+                    lo_prev = res[0] - period - tol
+                    if lo_prev < valid_start or lo_prev + 2 * tol <= min_onset:
+                        break
+                    j0 = int(lo_prev) - self._buf_start
+                    j1 = int(res[0] - period + tol) - self._buf_start
+                    pk_prev = self._buf_start + j0 + int(np.argmax(env[j0:j1]))
+                    earlier = self._measure(
+                        env,
+                        pk_prev - lift - tail,
+                        pk_prev,
+                        pk_prev + lift + tail,
+                        cfg.acquire_min_snr_db,
+                    )
+                    if earlier is None or earlier[1] < cfg.min_peak_ratio * res[1]:
+                        break
+                    res = earlier
                 if res is None:
-                    st.cursor = start + 0.5 * period
+                    st.cursor = start + period
                     continue
                 onset = res[0]
                 if st.history:
@@ -356,6 +390,7 @@ class OnsetBeatTracker:
                 beat = BeatOnset(idx, onset, res[1], res[2], self.segment)
                 self._accept(beat)
                 st.locked = True
+                st.confirmed = False
                 st.next_index = idx + 1
                 out.append(beat)
 
