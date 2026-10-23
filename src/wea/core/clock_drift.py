@@ -195,6 +195,7 @@ class SampleRateDriftEstimator:
         recalc_interval_sec: float = DEFAULT_RECALC_INTERVAL_SEC,
         ema_alpha: float = DEFAULT_EMA_ALPHA,
         cpu_skew_ppm: float = 0.0,
+        dynamic_tracking: bool = True,
     ) -> None:
         """Initialize the sample rate drift estimator.
 
@@ -208,6 +209,11 @@ class SampleRateDriftEstimator:
             recalc_interval_sec: Minimum elapsed interval between OLS recalculations (default 0.5s).
             ema_alpha: First-order EMA smoothing factor for OLS slope updates, clamped to [0.01, 1.0].
             cpu_skew_ppm: Host CPU monotonic clock skew in ppm measured via AtomicNTPDiscipline.
+            dynamic_tracking: If False, ``update()`` does not regress sample counts against
+                the host clock and ``effective_fs`` is the nominal rate corrected only by
+                ``calibration_ppm``. The host clock is itself an uncalibrated crystal and the
+                audio callback timestamps carry scheduling jitter (milliseconds on Windows),
+                so without NTP disciplining the "correction" adds error instead of removing it.
         """
         if nominal_fs <= 0.0:
             logger.error("Invalid nominal_fs=%.2f (must be positive)", nominal_fs)
@@ -233,6 +239,7 @@ class SampleRateDriftEstimator:
         self.recalc_interval_sec: float = float(recalc_interval_sec)
         self.ema_alpha: float = float(np.clip(ema_alpha, 0.01, 1.0))
         self.cpu_skew_ppm: float = float(cpu_skew_ppm)
+        self.dynamic_tracking: bool = bool(dynamic_tracking)
 
         self._lock = threading.Lock()
         self._history: deque[tuple[float, float]] = deque()
@@ -289,9 +296,18 @@ class SampleRateDriftEstimator:
 
     @property
     def effective_fs(self) -> float:
-        """Return the effective sample rate in Hz combining dynamic OLS, quartz cal, and NTP skew."""
-        base_fs = self._dynamic_fs if self._is_converged else self.nominal_fs
-        return float(base_fs * (1.0 + (self.calibration_ppm - self.cpu_skew_ppm) * 1e-6))
+        """Return the effective sample rate in Hz combining dynamic OLS, quartz cal, and NTP skew.
+
+        The NTP CPU skew only corrects a rate that was measured against the host clock, so it
+        is applied only once the dynamic OLS estimate is active.
+        """
+        if self._is_converged:
+            base_fs = self._dynamic_fs
+            skew_ppm = self.cpu_skew_ppm
+        else:
+            base_fs = self.nominal_fs
+            skew_ppm = 0.0
+        return float(base_fs * (1.0 + (self.calibration_ppm - skew_ppm) * 1e-6))
 
     @property
     def drift_ppm(self) -> float:
@@ -324,6 +340,8 @@ class SampleRateDriftEstimator:
         n_samp = float(chunk_samples)
         if n_samp < 0.0:
             logger.warning("Rejected negative chunk_samples=%.2f", n_samp)
+            return self.effective_fs
+        if not self.dynamic_tracking:
             return self.effective_fs
 
         with self._lock:

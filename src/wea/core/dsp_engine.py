@@ -9,7 +9,8 @@ from typing import Self
 import numpy as np
 import scipy.fft
 from numpy.typing import NDArray
-from scipy.signal import butter, hilbert, sosfilt, sosfilt_zi, sosfiltfilt
+from scipy.ndimage import maximum_filter1d
+from scipy.signal import butter, hilbert, oaconvolve, sosfilt, sosfilt_zi, sosfiltfilt
 
 from wea.core.clock_drift import SampleRateDriftEstimator
 from wea.core.models import BeatEvent, BeatTelemetry, WatchConfig
@@ -48,6 +49,22 @@ class DSPEngine:
     AGC_NOISE_GATE_FLOOR: float = 1e-5
     AGC_MIN_GAIN: float = 0.05
     AGC_MAX_GAIN: float = 500.0
+    # Standard escapement frequencies used for automatic BPH detection.
+    STANDARD_BPH: tuple[int, ...] = (14400, 18000, 19800, 21600, 25200, 28800, 36000)
+    # Lowest amplitude considered when sizing the P1 -> P3 search window (longest lift time).
+    LIFT_SEARCH_MIN_AMPLITUDE_DEG: float = 140.0
+    # Highest amplitude considered when sizing the P1 -> P3 search window (shortest lift time).
+    LIFT_SEARCH_MAX_AMPLITUDE_DEG: float = 340.0
+    # Decay tail of each escapement sound appended around the lift window.
+    BEAT_TAIL_SEC: float = 0.0035
+    # Minimum normalized autocorrelation required to trust a detected BPH.
+    BPH_DETECT_MIN_SCORE: float = 0.35
+    # The configured BPH is kept while its score is at least this fraction of the best one.
+    BPH_KEEP_RATIO: float = 0.85
+    # A doubled BPH is preferred over the best candidate when it reaches this fraction.
+    BPH_HARMONIC_RATIO: float = 0.4
+    # Below this many beats, per-beat analysis runs inline (thread hand-off costs more).
+    PARALLEL_BEAT_MIN_TASKS: int = 64
 
     def __init__(
         self,
@@ -61,6 +78,7 @@ class DSPEngine:
         workers: int | None = None,
         drift_estimator: SampleRateDriftEstimator | None = None,
         p1_threshold_ratio: float = 0.18,
+        auto_bph: bool = True,
     ) -> None:
         """Initialize the multi-threaded DSP engine.
 
@@ -77,6 +95,9 @@ class DSPEngine:
                 Defaults to ``max(1, (os.cpu_count() or 2) // 2)``.
             drift_estimator: Optional ``SampleRateDriftEstimator`` providing ``effective_fs``.
             p1_threshold_ratio: Relative onset threshold for unlocking impulse P1.
+            auto_bph: If True, the beat rate is detected from the signal and used instead of
+                the configured BPH when the configured one clearly does not match the audio
+                (a wrong BPH otherwise produces meaningless rate, beat error and amplitude).
         """
         if config is not None:
             self.config = config
@@ -94,6 +115,8 @@ class DSPEngine:
         self.filter_order: int = int(filter_order)
         self.drift_estimator: SampleRateDriftEstimator | None = drift_estimator
         self.p1_threshold_ratio: float = float(p1_threshold_ratio)
+        self.auto_bph: bool = bool(auto_bph)
+        self._last_bph_mismatch: tuple[int, int] | None = None
 
         self._sos: NDArray[np.float64] = self._design_bandpass_sos(
             float(self.config.sample_rate),
@@ -101,6 +124,7 @@ class DSPEngine:
             self.highcut_hz,
             self.filter_order,
         )
+        self._sos_alt_cache: tuple[int, NDArray[np.float64]] | None = None
         self._sos_zi: NDArray[np.float64] | None = None
         self._agc_env_level: float | None = None
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=self.workers)
@@ -192,15 +216,7 @@ class DSPEngine:
             return sig.copy()
 
         target_fs = float(fs) if fs is not None else float(self.config.sample_rate)
-        if abs(target_fs - float(self.config.sample_rate)) > 1.0:
-            sos = self._design_bandpass_sos(
-                target_fs,
-                self.highpass_cutoff_hz,
-                self.highcut_hz,
-                self.filter_order,
-            )
-        else:
-            sos = self._sos
+        sos = self._sos_for_fs(target_fs)
 
         if streaming:
             if self._sos_zi is None:
@@ -210,6 +226,46 @@ class DSPEngine:
             return np.asarray(filtered, dtype=np.float64)
 
         return np.asarray(sosfiltfilt(sos, sig), dtype=np.float64)
+
+    # A clock drift of a few hundred ppm moves the band edges by a few Hz, which is irrelevant
+    # for a 3-14 kHz bandpass. Only a real sample-rate change (e.g. 48k -> 96k) needs a redesign.
+    _SOS_REDESIGN_REL_TOL: float = 0.01
+
+    def _sos_for_fs(self, target_fs: float) -> NDArray[np.float64]:
+        """Return the bandpass SOS for ``target_fs``, reusing the cached design when possible."""
+        nominal_fs = float(self.config.sample_rate)
+        if abs(target_fs - nominal_fs) <= self._SOS_REDESIGN_REL_TOL * nominal_fs:
+            return self._sos
+        cached = self._sos_alt_cache
+        if cached is not None and cached[0] == round(target_fs):
+            return cached[1]
+        sos = self._design_bandpass_sos(
+            target_fs,
+            self.highpass_cutoff_hz,
+            self.highcut_hz,
+            self.filter_order,
+        )
+        self._sos_alt_cache = (round(target_fs), sos)
+        return sos
+
+    @staticmethod
+    def _moving_average_same(signal: NDArray[np.float64], win: int) -> NDArray[np.float64]:
+        """Box-car moving average equivalent to ``np.convolve(x, ones(win)/win, 'same')``.
+
+        Uses overlap-add FFT convolution (O(N log K)) instead of the direct O(N * K) loop of
+        ``np.convolve``, which dominated ``process_window`` for long kernels at 96 kHz.
+        """
+        n = len(signal)
+        win = int(win)
+        if n == 0 or win <= 1:
+            return np.asarray(signal, dtype=np.float64).copy()
+        if win > n:
+            kernel = np.ones(win, dtype=np.float64) / float(win)
+            return np.convolve(signal, kernel, mode="same")
+        kernel = np.full(win, 1.0 / float(win), dtype=np.float64)
+        full = oaconvolve(signal, kernel, mode="full")
+        start = (win - 1) // 2
+        return np.asarray(full[start : start + n], dtype=np.float64)
 
     @staticmethod
     def _estimate_clean_beat_peak(envelope: NDArray[np.float64], fs_eff: float) -> float:
@@ -282,8 +338,7 @@ class DSPEngine:
         # 6 ms energy-bridging envelope to merge carrier oscillations inside a continuous bump
         # while keeping genuine watch beats (< 10 ms) narrow.
         short_win = max(5, int(round(0.006 * fs_eff)))
-        short_kernel = np.ones(short_win, dtype=np.float64) / float(short_win)
-        short_env = np.convolve(np.abs(sig), short_kernel, mode="same")
+        short_env = self._moving_average_same(np.abs(sig), short_win)
 
         med = float(np.median(short_env))
         mad = float(np.median(np.abs(short_env - med))) + 1e-12
@@ -473,13 +528,11 @@ class DSPEngine:
 
         # Fast moving-average smoothing window (~0.8 ms, within 0.5 ms - 1.0 ms) for macro-beat timing
         macro_win = max(int(round(0.0008 * fs_eff)), 3)
-        macro_kernel = np.ones(macro_win, dtype=np.float64) / float(macro_win)
-        macro_env = np.convolve(inst_mag, macro_kernel, mode="same")
+        macro_env = self._moving_average_same(inst_mag, macro_win)
 
         # High-resolution smoothing (~0.12 ms) for micro-impulse inspection (P1, P2, P3)
         micro_win = max(int(round(0.00012 * fs_eff)), 3)
-        micro_kernel = np.ones(micro_win, dtype=np.float64) / float(micro_win)
-        micro_env = np.convolve(inst_mag, micro_kernel, mode="same")
+        micro_env = self._moving_average_same(inst_mag, micro_win)
 
         return macro_env, micro_env
 
@@ -491,11 +544,171 @@ class DSPEngine:
             return float(self.drift_estimator.effective_fs)
         return float(self.config.sample_rate)
 
+    @staticmethod
+    def lift_time_from_amplitude(amplitude_deg: float, lift_angle: float, bph: int) -> float:
+        """Return the physical lift time (s) for a given amplitude.
+
+        ``t_lift = arcsin(LA / (2 * A)) / (pi * f_osc)`` with ``f_osc = bph / 7200``: the impulse
+        pin crosses the lift angle from ``-LA / 2`` to ``+LA / 2`` around the dead point.
+        """
+        if amplitude_deg <= 0.0 or lift_angle <= 0.0 or bph <= 0:
+            return 0.0
+        f_osc = float(bph) / 7200.0
+        ratio = float(np.clip(lift_angle / (2.0 * amplitude_deg), 1e-6, 0.999999))
+        return float(np.arcsin(ratio) / (np.pi * f_osc))
+
+    @classmethod
+    def _lift_time_bounds(cls, bph: int, lift_angle: float) -> tuple[float, float]:
+        """Return the ``(t_min, t_max)`` P1 -> P3 search range in seconds.
+
+        ``t_min`` corresponds to the highest plausible amplitude and ``t_max`` to the lowest,
+        with a margin for timing noise and the lift-angle uncertainty (+-2 deg ~ +-4 %).
+        """
+        t_min = cls.lift_time_from_amplitude(cls.LIFT_SEARCH_MAX_AMPLITUDE_DEG, lift_angle, bph)
+        t_max = cls.lift_time_from_amplitude(cls.LIFT_SEARCH_MIN_AMPLITUDE_DEG, lift_angle, bph)
+        return 0.85 * t_min, 1.10 * t_max
+
+    @classmethod
+    def _beat_half_window_sec(cls, bph: int, lift_angle: float) -> float:
+        """Half-width (s) of the window cut around each macro peak for P1/P2/P3 analysis.
+
+        The macro peak can be either P1 or P3, so the window must hold a full lift time on
+        both sides plus the decay tail of the sound.
+        """
+        _, t_max = cls._lift_time_bounds(bph, lift_angle)
+        return t_max + cls.BEAT_TAIL_SEC
+
+    @classmethod
+    def bph_autocorr_scores(
+        cls,
+        envelope: NDArray[np.float64],
+        fs_eff: float,
+        candidates: tuple[int, ...] | list[int] | None = None,
+        decimated_rate_hz: float = 1000.0,
+    ) -> dict[int, float]:
+        """Score each candidate BPH by the envelope autocovariance at its beat period.
+
+        The envelope is decimated to ~1 kHz with block maxima (keeps the impulsive peaks),
+        floored at its median, and autocorrelated through the FFT. Each score is the maximum
+        unbiased, normalized autocorrelation inside +-3 % of the candidate beat period
+        (+-3 % covers +-2600 s/d and several ms of beat error).
+        """
+        cand = tuple(candidates) if candidates is not None else cls.STANDARD_BPH
+        scores: dict[int, float] = {int(b): 0.0 for b in cand}
+        env = np.asarray(envelope, dtype=np.float64).ravel()
+        if len(env) == 0 or fs_eff <= 0.0:
+            return scores
+
+        block = max(1, int(round(fs_eff / decimated_rate_hz)))
+        n_blocks = len(env) // block
+        if n_blocks < 16:
+            return scores
+        fs_dec = fs_eff / float(block)
+        dec = env[: n_blocks * block].reshape(n_blocks, block).max(axis=1)
+        dec = np.clip(dec - float(np.median(dec)), 0.0, None)
+        # Widen each pulse by +-2.5 ms so tick->tock and tock->tick intervals (P +- beat error)
+        # still overlap at lag P; otherwise a large beat error splits the peak in two.
+        widen = max(1, int(round(0.005 * fs_dec)))
+        if widen > 1:
+            dec = maximum_filter1d(dec, size=widen, mode="nearest")
+        # Autocovariance, not raw autocorrelation: a positive mean alone would correlate at
+        # every lag and make plain noise look periodic.
+        dec = dec - float(np.mean(dec))
+        if float(np.max(np.abs(dec))) <= 0.0:
+            return scores
+
+        n = len(dec)
+        nfft = int(scipy.fft.next_fast_len(2 * n))
+        spec = scipy.fft.rfft(dec, nfft)
+        acf = scipy.fft.irfft(spec * np.conj(spec), nfft)[:n]
+        acf = acf / (n - np.arange(n, dtype=np.float64))  # unbiased
+        if acf[0] <= 0.0:
+            return scores
+        acf = acf / acf[0]
+
+        for bph in cand:
+            period_dec = (3600.0 / float(bph)) * fs_dec
+            lo = int(np.floor(0.97 * period_dec))
+            hi = int(np.ceil(1.03 * period_dec))
+            # Require at least ~3 beat periods in the window for a meaningful estimate
+            if lo < 1 or hi >= n // 3:
+                continue
+            scores[int(bph)] = float(np.max(acf[lo : hi + 1]))
+        return scores
+
+    @classmethod
+    def estimate_bph(
+        cls,
+        envelope: NDArray[np.float64],
+        fs_eff: float,
+        candidates: tuple[int, ...] | list[int] | None = None,
+    ) -> tuple[int, float, dict[int, float]]:
+        """Estimate the movement BPH from the beat envelope.
+
+        A periodic train also correlates at twice its period, so the slower sub-harmonic
+        (e.g. 14400 for a 28800 movement) scores high as well, often higher when tick and
+        tock sound different. The best-scoring candidate is therefore replaced by its double
+        whenever that double is also clearly periodic.
+
+        Returns:
+            ``(detected_bph, best_score, scores)``; ``detected_bph`` is 0 if nothing periodic
+            was found above ``BPH_DETECT_MIN_SCORE``.
+        """
+        scores = cls.bph_autocorr_scores(envelope, fs_eff, candidates)
+        if not scores:
+            return 0, 0.0, scores
+        best_score = max(scores.values())
+        if best_score < cls.BPH_DETECT_MIN_SCORE:
+            return 0, best_score, scores
+        detected = max(scores, key=lambda b: scores[b])
+        doubled = 2 * detected
+        if scores.get(doubled, 0.0) >= cls.BPH_HARMONIC_RATIO * best_score:
+            detected = doubled
+        return int(detected), float(best_score), scores
+
+    def _resolve_active_bph(
+        self,
+        macro_env: NDArray[np.float64],
+        configured_bph: int,
+        fs_eff: float,
+    ) -> tuple[int, int, bool]:
+        """Return ``(active_bph, detected_bph, mismatch)`` for this window.
+
+        The configured BPH is kept unless the signal clearly beats at another standard rate.
+        """
+        candidates = tuple(sorted(set(self.STANDARD_BPH) | {int(configured_bph)}))
+        detected, best_score, scores = self.estimate_bph(macro_env, fs_eff, candidates)
+        if detected == 0 or detected == configured_bph:
+            self._last_bph_mismatch = None
+            return configured_bph, detected, False
+        cfg_score = scores.get(int(configured_bph), 0.0)
+        # A configured BPH at half the real rate also correlates strongly (every second beat
+        # lines up), so its score alone cannot confirm it.
+        is_subharmonic = abs(detected / float(configured_bph) - 2.0) <= 0.04
+        if cfg_score >= self.BPH_KEEP_RATIO * best_score and not is_subharmonic:
+            self._last_bph_mismatch = None
+            return configured_bph, detected, False
+        active = detected if self.auto_bph else configured_bph
+        # Log on state changes only; this runs for every analysis window (~4 Hz).
+        if self._last_bph_mismatch == (configured_bph, detected):
+            return active, detected, True
+        self._last_bph_mismatch = (configured_bph, detected)
+        logger.warning(
+            "Configured BPH %d does not match the signal (detected %d BPH, score %.2f vs %.2f)%s",
+            configured_bph,
+            detected,
+            best_score,
+            cfg_score,
+            "; analyzing with the detected BPH" if self.auto_bph else "",
+        )
+        return active, detected, True
+
     def detect_macro_beat_peaks(
         self,
         macro_env: NDArray[np.float64],
         bph: int,
         fs_eff: float,
+        edge_samples: int | None = None,
     ) -> list[int]:
         """Detect tick/tock peak indices using robust median+MAD, 0.70*T0 dead-time, and phase-comb tracking.
 
@@ -503,6 +716,8 @@ class DSPEngine:
             macro_env: Smoothed macro-beat Hilbert amplitude envelope (~1000 Hz bandwidth).
             bph: Nominal beats per hour.
             fs_eff: Effective sampling rate in Hz.
+            edge_samples: Peaks closer than this to either buffer edge are discarded so the
+                per-beat analysis window fits. Defaults to the lift-time based half window.
 
         Returns:
             List of sample indices corresponding to dominant beat peaks.
@@ -514,8 +729,12 @@ class DSPEngine:
         t0 = 3600.0 / float(bph)
         nominal_samples = t0 * fs_eff
         refractory_samples = max(1, int(round(self.REFRACTORY_FACTOR * nominal_samples)))
-        pre_samples = int(round(0.012 * fs_eff))
-        post_samples = int(round(0.008 * fs_eff))
+        if edge_samples is None:
+            edge_samples = int(
+                round(self._beat_half_window_sec(bph, self.config.lift_angle) * fs_eff)
+            )
+        pre_samples = int(edge_samples)
+        post_samples = int(edge_samples)
 
         med = float(np.median(macro_env))
         mad = float(np.median(np.abs(macro_env - med))) + 1e-12
@@ -526,6 +745,11 @@ class DSPEngine:
             med + 5.5 * robust_sigma,
             med + 0.22 * (clean_peak - med),
         )
+
+        # Indices above threshold, so the scan jumps straight to the next candidate instead
+        # of stepping one sample at a time in Python (that loop held the GIL for ~100k
+        # iterations per window on noisy signals).
+        above_idx = np.flatnonzero(macro_env > adaptive_thresh)
 
         peaks: list[int] = []
         i = pre_samples
@@ -546,23 +770,32 @@ class DSPEngine:
                         i = comb_max_idx + refractory_samples
                         continue
 
-            if macro_env[i] > adaptive_thresh:
-                win_end = min(n_samples, i + refractory_samples)
-                local_max_idx = i + int(np.argmax(macro_env[i:win_end]))
-                if pre_samples <= local_max_idx < limit:
-                    peaks.append(local_max_idx)
-                i = local_max_idx + refractory_samples
-            else:
-                i += 1
+            k = int(np.searchsorted(above_idx, i))
+            if k >= len(above_idx):
+                break
+            i = int(above_idx[k])
+            if i >= limit:
+                break
+            win_end = min(n_samples, i + refractory_samples)
+            local_max_idx = i + int(np.argmax(macro_env[i:win_end]))
+            if pre_samples <= local_max_idx < limit:
+                peaks.append(local_max_idx)
+            i = local_max_idx + refractory_samples
 
         return peaks
 
     def _analyze_single_beat(
         self,
-        args: tuple[NDArray[np.float64], NDArray[np.float64], int, float],
+        args: tuple,
     ) -> BeatEvent | None:
-        """Isolate unlocking (P1), impulse (P2), and drop (P3) within a single beat window."""
-        sub_fine, sub_wave, start_idx, fs_eff = args
+        """Isolate unlocking (P1), impulse (P2), and drop (P3) within a single beat window.
+
+        ``args`` is ``(sub_fine, sub_wave, start_idx, fs_eff[, bph, lift_angle])``; the last
+        two default to the engine configuration.
+        """
+        sub_fine, sub_wave, start_idx, fs_eff = args[:4]
+        bph = int(args[4]) if len(args) > 4 else int(self.config.bph)
+        lift_deg = float(args[5]) if len(args) > 5 else float(self.config.lift_angle)
         if len(sub_fine) < 10:
             return None
 
@@ -573,16 +806,9 @@ class DSPEngine:
         dom_idx = int(np.argmax(sub_fine))
         dom_exact = self._parabolic_peak_interp(sub_fine, dom_idx)
 
-        # Bound the companion impulse search to the physical horological lift-time range
-        # [155 deg .. 340 deg] so background noise 10 ms ahead of the beat cannot fake P1.
-        t0 = 3600.0 / float(max(self.config.bph, 3600))
-        lift_deg = float(self.config.lift_angle)
-        dt_min = (
-            (t0 / np.pi) * float(np.arcsin(np.clip(lift_deg / (2.0 * 340.0), 0.01, 0.99))) * 0.80
-        )
-        dt_max = (
-            (t0 / np.pi) * float(np.arcsin(np.clip(lift_deg / (2.0 * 155.0), 0.01, 0.99))) * 1.25
-        )
+        # Bound the companion impulse search to the physical lift-time range
+        # [140 deg .. 340 deg] so background noise far ahead of the beat cannot fake P1.
+        dt_min, dt_max = self._lift_time_bounds(max(bph, 3600), lift_deg)
         n_min = max(2, int(round(dt_min * fs_eff)))
         n_max = max(n_min + 4, int(round(dt_max * fs_eff)))
 
@@ -671,10 +897,12 @@ class DSPEngine:
         lift_angle: float,
         bph: int,
     ) -> float:
-        """Compute balance wheel amplitude (degrees) via the horological sine relation.
+        """Compute balance wheel amplitude (degrees) from the lift time.
 
-        Applies ``theta = alpha / sin(pi * f * t_lift)`` where ``alpha`` is ``lift_angle``
-        and ``f = bph / 7200.0`` Hz, clamped to realistic bounds [100.0°, 340.0°].
+        Applies ``A = LA / (2 * sin(pi * f_osc * t_lift))`` with ``f_osc = bph / 7200`` Hz,
+        where ``t_lift`` is the time the impulse pin needs to cross the lift angle ``LA``
+        (unlocking P1 -> drop P3). Clamped to realistic bounds [100°, 340°].
+        Example: 28800 BPH, LA = 52°, t_lift = 7.40 ms -> A ~= 280°.
         """
         if t_lift <= 1e-6 or lift_angle <= 0.0 or bph <= 0:
             return cls.MIN_AMPLITUDE_DEG
@@ -683,7 +911,7 @@ class DSPEngine:
         sin_val = float(np.sin(arg))
         if sin_val <= 1e-6:
             return cls.MAX_AMPLITUDE_DEG
-        theta = float(lift_angle) / sin_val
+        theta = float(lift_angle) / (2.0 * sin_val)
         return float(np.clip(theta, cls.MIN_AMPLITUDE_DEG, cls.MAX_AMPLITUDE_DEG))
 
     def process_window(
@@ -720,21 +948,33 @@ class DSPEngine:
         normalized = self.apply_agc(conditioned, fs=fs_eff, streaming=streaming)
         macro_env, micro_env = self.compute_envelopes(normalized, fs=fs_eff)
 
-        peak_indices = self.detect_macro_beat_peaks(macro_env, bph=active_bph, fs_eff=fs_eff)
-        n_samples = len(normalized)
-        pre_samples = int(round(0.012 * fs_eff))
-        post_samples = int(round(0.008 * fs_eff))
+        configured_bph = active_bph
+        active_bph, detected_bph, bph_mismatch = self._resolve_active_bph(
+            macro_env, configured_bph, fs_eff
+        )
 
-        tasks: list[tuple[NDArray[np.float64], NDArray[np.float64], int, float]] = []
+        half_window = int(round(self._beat_half_window_sec(active_bph, active_lift) * fs_eff))
+        peak_indices = self.detect_macro_beat_peaks(
+            macro_env, bph=active_bph, fs_eff=fs_eff, edge_samples=half_window
+        )
+        n_samples = len(normalized)
+
+        tasks: list[tuple] = []
         for pk_idx in peak_indices:
-            s0 = max(0, pk_idx - pre_samples)
-            s1 = min(n_samples, pk_idx + post_samples)
+            s0 = max(0, pk_idx - half_window)
+            s1 = min(n_samples, pk_idx + half_window)
             if len(blank_mask) == n_samples and np.any(blank_mask[s0:s1]):
                 continue
-            tasks.append((micro_env[s0:s1], normalized[s0:s1], s0, fs_eff))
+            tasks.append((micro_env[s0:s1], normalized[s0:s1], s0, fs_eff, active_bph, active_lift))
 
         if tasks:
-            if self._executor is not None and self.workers > 1 and len(tasks) > 1:
+            # Per-beat work is a few microseconds of GIL-bound NumPy calls; a thread hand-off
+            # only pays off for very long windows.
+            if (
+                self._executor is not None
+                and self.workers > 1
+                and len(tasks) >= self.PARALLEL_BEAT_MIN_TASKS
+            ):
                 raw_results = list(self._executor.map(self._analyze_single_beat, tasks))
             else:
                 raw_results = [self._analyze_single_beat(task) for task in tasks]
@@ -743,7 +983,8 @@ class DSPEngine:
             beats = []
 
         if len(beats) < 3:
-            logger.warning(
+            # Normal while no watch is on the microphone; DEBUG avoids a 4 Hz warning flood.
+            logger.debug(
                 "Insufficient beats detected (%d < 3) for telemetry calculation",
                 len(beats),
             )
@@ -759,6 +1000,9 @@ class DSPEngine:
                 micro_envelope=micro_env,
                 filtered_signal=normalized,
                 effective_fs=fs_eff,
+                bph=active_bph,
+                detected_bph=detected_bph,
+                bph_mismatch=bph_mismatch,
             )
 
         p1_times = np.array([b.timestamp_p1 for b in beats], dtype=np.float64)
@@ -797,24 +1041,19 @@ class DSPEngine:
         if len(even_intervals) > 0 and len(odd_intervals) > 0:
             mean_even = self._trimmed_mean(even_intervals)
             mean_odd = self._trimmed_mean(odd_intervals)
-            beat_error_ms = abs(mean_even - mean_odd) * 1000.0
+            # Timegrapher convention: intervals alternate P + d / P - d and the beat error is
+            # |d|, i.e. half the tick/tock interval difference.
+            beat_error_ms = 0.5 * abs(mean_even - mean_odd) * 1000.0
         else:
             beat_error_ms = 0.0
 
         # Amplitude (deg) from pallet lift duration between unlocking (t1) and drop (t3)
         dt_p1_p3 = (p3_times - p1_times) + self.CARRIER_PEAK_ALIGNMENT_SEC
-        median_dt_13 = float(np.median(dt_p1_p3))
-        f_osc = float(active_bph) / 7200.0
-        actual_beat_period = 0.5 * mean_t_osc
-        # Map half-angle impulse delay dt_13 to equivalent full-lift duration t_lift
-        # for the horological sine relation theta = alpha / sin(pi * f * t_lift)
-        half_sin = float(
-            np.sin(np.clip(np.pi * median_dt_13 / actual_beat_period, 1e-6, 0.5 * np.pi - 1e-6))
-        )
-        full_sin = float(np.clip(2.0 * half_sin, 1e-6, 0.999999))
-        t_lift_eff = float(np.arcsin(full_sin) / (np.pi * f_osc))
+        # The P1 -> P3 interval is the lift time itself: A = LA / (2 * sin(pi * f_osc * t_lift)).
+        # The nominal f_osc is used; the rate correction (< 1e-4) is negligible here.
+        t_lift = float(np.median(dt_p1_p3))
         amplitude_deg = self.compute_amplitude_from_lift_time(
-            t_lift=t_lift_eff,
+            t_lift=t_lift,
             lift_angle=active_lift,
             bph=active_bph,
         )
@@ -856,6 +1095,9 @@ class DSPEngine:
             micro_envelope=micro_env,
             filtered_signal=normalized,
             effective_fs=fs_eff,
+            bph=active_bph,
+            detected_bph=detected_bph,
+            bph_mismatch=bph_mismatch,
         )
         logger.debug(
             "DSPEngine telemetry: rate=%+.3f s/d, BE=%.4f ms, amp=%.2f deg, "

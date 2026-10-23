@@ -351,6 +351,16 @@ class MainWin(QMainWindow):
         self._last_rate_bias_spd: float = 0.0
         self._osc_rng = np.random.default_rng(2026)
 
+        # Waveform frames are coalesced: at most one redraw per WAVEFORM_MIN_INTERVAL_S, the
+        # latest frame wins. Queued frames used to pile up whenever painting was slow.
+        self._pending_waveform: tuple[np.ndarray, np.ndarray] | None = None
+        self._last_waveform_draw: float = 0.0
+        self._waveform_seen: bool = False
+        self._bph_warning_shown: bool = False
+        self._waveform_flush_timer = QTimer(self)
+        self._waveform_flush_timer.setSingleShot(True)
+        self._waveform_flush_timer.timeout.connect(self._flush_pending_waveform)
+
         # Audio recording state (same duration as test)
         self._recorded_audio: np.ndarray | None = None
         self._recorded_sample_rate: int = 48000
@@ -367,7 +377,11 @@ class MainWin(QMainWindow):
 
         # Real-time Qt DSP worker living in a dedicated QThread via moveToThread
         self.dsp_thread = QThread(self)
-        self.dsp_worker = DSPStreamWorker(config=self.current_watch_config())
+        # Analysis runs on its own thread so DSP never stalls the 30 FPS waveform stream
+        self.dsp_worker = DSPStreamWorker(
+            config=self.current_watch_config(),
+            analysis_in_background=True,
+        )
         self.dsp_worker.moveToThread(self.dsp_thread)
         self.dsp_worker.telemetry_ready.connect(self._on_telemetry_ready)
         self.dsp_worker.waveform_ready.connect(self._on_waveform_ready)
@@ -725,9 +739,19 @@ class MainWin(QMainWindow):
 
     @staticmethod
     def _optimize_high_freq_curve(curve: pg.PlotDataItem) -> None:
-        """Enable view clipping and peak-preserving auto-downsampling on a high-rate curve."""
+        """Make a high-rate curve cheap to redraw.
+
+        Enables view clipping and peak-preserving auto-downsampling, and draws it with a
+        1 px cosmetic pen without antialiasing: Qt's raster engine is many times slower for
+        wide or antialiased polylines, which is what made redraws crawl on Windows.
+        """
         curve.setClipToView(True)
         curve.setDownsampling(auto=True, method="peak")
+        curve.opts["antialias"] = False
+        pen = pg.mkPen(curve.opts.get("pen"))
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        curve.setPen(pen)
 
     @staticmethod
     def _sync_combo_popup_width(combo: QComboBox, min_width: int = 90) -> None:
@@ -2033,6 +2057,11 @@ class MainWin(QMainWindow):
         self.osc_envelope_curve.setData([], [])
         self.osc_impulse_markers.setData([], [])
         self.audio_waveform_curve.setData([], [])
+        self._pending_waveform = None
+        self._waveform_seen = False
+        if self._bph_warning_shown:
+            self.statusBar().clearMessage()
+            self._bph_warning_shown = False
 
         duration_s = float(self.spn_duration.value())
         self.paper_tape_plot.setXRange(0.0, max(10.0, duration_s))
@@ -2389,13 +2418,17 @@ class MainWin(QMainWindow):
                     ]
                     self.osc_impulse_markers.setData(spots)
 
-            # Bottom-Right Real-Time Audio Waveform: scrolling 600 ms window
+            self._update_bph_warning(telemetry)
+
+            # Bottom-Right Real-Time Audio Waveform: only when no live waveform stream exists.
+            # The worker already streams it at 30 FPS; redrawing it here from a different
+            # window made the trace jump on every telemetry update.
             wave_src = (
                 telemetry.filtered_signal
                 if len(telemetry.filtered_signal) > 0
                 else telemetry.envelope
             )
-            if len(wave_src) > 0:
+            if not self._waveform_seen and len(wave_src) > 0:
                 t_wav_ms, y_wav = DSPStreamWorker._extract_waveform_window(
                     wave_src,
                     effective_fs=fs,
@@ -2408,10 +2441,45 @@ class MainWin(QMainWindow):
         if self._capture_start_monotonic is not None and elapsed_s >= stab_s + duration_s:
             self.stop_capture()
 
+    WAVEFORM_MIN_INTERVAL_S: float = 1.0 / 30.0
+
     def _on_waveform_ready(self, time_axis: np.ndarray, waveform: np.ndarray) -> None:
-        """Slot updating the real-time acoustic waveform curve from DSPStreamWorker."""
-        if time_axis is not None and waveform is not None and len(time_axis) > 0:
-            self.audio_waveform_curve.setData(time_axis, waveform)
+        """Slot updating the real-time acoustic waveform curve from DSPStreamWorker.
+
+        Draws immediately unless a frame was drawn less than ``WAVEFORM_MIN_INTERVAL_S``
+        ago; in that case only the newest frame is kept and drawn when the interval ends.
+        """
+        if time_axis is None or waveform is None or len(time_axis) == 0:
+            return
+        self._waveform_seen = True
+        self._pending_waveform = (time_axis, waveform)
+        wait_s = self.WAVEFORM_MIN_INTERVAL_S - (time.monotonic() - self._last_waveform_draw)
+        if wait_s <= 0.0:
+            self._flush_pending_waveform()
+        elif not self._waveform_flush_timer.isActive():
+            self._waveform_flush_timer.start(max(1, int(wait_s * 1000.0)))
+
+    def _flush_pending_waveform(self) -> None:
+        """Draw the most recent pending waveform frame, if any."""
+        frame = self._pending_waveform
+        if frame is None:
+            return
+        self._pending_waveform = None
+        self._last_waveform_draw = time.monotonic()
+        self.audio_waveform_curve.setData(frame[0], frame[1])
+
+    def _update_bph_warning(self, telemetry: BeatTelemetry) -> None:
+        """Show a status-bar warning while the configured BPH does not match the watch."""
+        if telemetry.bph_mismatch and telemetry.detected_bph > 0:
+            msg = self.translator.tr("status_bph_mismatch").format(
+                configured=self.current_watch_config().bph,
+                detected=telemetry.detected_bph,
+            )
+            self.statusBar().showMessage(msg)
+            self._bph_warning_shown = True
+        elif self._bph_warning_shown:
+            self.statusBar().clearMessage()
+            self._bph_warning_shown = False
 
     def _on_drift_updated(
         self,

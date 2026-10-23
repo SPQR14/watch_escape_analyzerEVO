@@ -81,6 +81,10 @@ class Translator:
             "status_drift_format": (
                 "Clock Drift: {ppm:+.2f} ppm | Effective Fs: {fs:.2f} Hz | Bias: {bias:+.2f} s/d"
             ),
+            "status_bph_mismatch": (
+                "Warning: configured {configured} BPH but the watch beats at {detected} BPH "
+                "- analyzing with {detected} BPH"
+            ),
         },
         "es": {
             "app_title": "Watch Escape Analyzer EVO — Banco de Pruebas DSP Horológico",
@@ -151,6 +155,10 @@ class Translator:
             "rate_bias": "Sesgo de Marcha",
             "status_drift_format": (
                 "Deriva de Reloj: {ppm:+.2f} ppm | Fs Efectiva: {fs:.2f} Hz | Sesgo: {bias:+.2f} s/d"
+            ),
+            "status_bph_mismatch": (
+                "Aviso: configurado a {configured} A/h pero el reloj bate a {detected} A/h "
+                "- analizando con {detected} A/h"
             ),
         },
     }

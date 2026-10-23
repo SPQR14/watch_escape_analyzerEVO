@@ -156,8 +156,12 @@ def test_hardware_audio_capture_portaudio_callbacks_into_dsp_worker() -> None:
 
             assert not received_errors
             assert worker._hardware_capture.overflow_count == 1
-            assert worker.ring_buffer.total_samples_written == len(synth_audio)
-            assert worker.ring_buffer.available_samples == len(synth_audio)
+            # The overflow on chunk #2 means samples were dropped before it, so the audio
+            # buffered up to then is discarded instead of being glued across the gap.
+            post_gap_samples = len(synth_audio) - 2 * chunk_size
+            assert worker.discontinuity_count == 1
+            assert worker.ring_buffer.total_samples_written == post_gap_samples
+            assert worker.ring_buffer.available_samples == post_gap_samples
             assert len(received_telemetry) >= 1
             latest = received_telemetry[-1]
             assert abs(latest.rate_spd - 3.5) <= 0.25

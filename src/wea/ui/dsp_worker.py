@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 from numpy.typing import NDArray
@@ -67,6 +68,8 @@ class DSPStreamWorker(QObject):
         synthetic_amplitude_deg: float = 280.0,
         synthetic_snr_db: float = 35.0,
         workers: int | None = None,
+        adc_dynamic_drift: bool = False,
+        analysis_in_background: bool = False,
         parent: QObject | None = None,
     ) -> None:
         """Initialize the real-time DSP worker and its underlying mathematical components.
@@ -84,6 +87,14 @@ class DSPStreamWorker(QObject):
             synthetic_amplitude_deg: Ground-truth amplitude (deg) used in synthetic mode.
             synthetic_snr_db: SNR (dB) used in synthetic simulation mode.
             workers: Number of worker threads inside ``DSPEngine``.
+            adc_dynamic_drift: Track the ADC rate against the host clock (OLS over callback
+                timestamps, plus NTP disciplining). Off by default: the host clock is not a
+                better reference than the ADC crystal and callback jitter adds rate noise.
+                Use ``calibration_ppm`` for a measured ADC correction instead.
+            analysis_in_background: Run ``DSPEngine.process_window`` on a dedicated analysis
+                thread so this worker's event loop keeps emitting 30 FPS waveforms while a
+                window is being analyzed. Windows arriving while an analysis is in flight are
+                skipped (the next tick analyzes the newest audio).
             parent: Optional Qt parent object.
         """
         super().__init__(parent)
@@ -104,9 +115,11 @@ class DSPStreamWorker(QObject):
 
         capacity_samples = int(round(self.buffer_duration_s * self.config.sample_rate))
         self.ring_buffer = AudioRingBuffer(capacity_samples=capacity_samples)
+        self.adc_dynamic_drift: bool = bool(adc_dynamic_drift)
         self.drift_estimator = SampleRateDriftEstimator(
             nominal_fs=float(self.config.sample_rate),
             calibration_ppm=float(calibration_ppm),
+            dynamic_tracking=self.adc_dynamic_drift,
         )
         self.ntp_discipline = AtomicNTPDiscipline()
         self.dsp_engine = DSPEngine(
@@ -116,6 +129,18 @@ class DSPStreamWorker(QObject):
         )
         self._hardware_capture: HardwareAudioCapture | None = None
         self._ntp_busy: bool = False
+        self._overflows_seen: int = 0
+        self.discontinuity_count: int = 0
+
+        self.analysis_in_background: bool = bool(analysis_in_background)
+        self._analysis_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="WEA-Analysis")
+            if self.analysis_in_background
+            else None
+        )
+        self._analysis_future: Future | None = None
+        # Bumped on start/stop/config changes so stale background results are dropped.
+        self._analysis_generation: int = 0
 
         self._window_samples: int = 0
         self._min_analysis_samples: int = 0
@@ -207,7 +232,7 @@ class DSPStreamWorker(QObject):
         t0 = self.config.nominal_beat_period
         rate_factor = 1.0 + (self.synthetic_rate_spd / SyntheticEscapeGenerator.SECONDS_PER_DAY)
         mean_beat_period = t0 / rate_factor
-        half_be_s = 0.5 * (self.synthetic_beat_error_ms * 1e-3)
+        half_be_s = SyntheticEscapeGenerator.beat_error_half_offset(self.synthetic_beat_error_ms)
 
         dt_p1_p3 = gen.compute_p1_p3_delay(
             self.synthetic_amplitude_deg,
@@ -374,7 +399,9 @@ class DSPStreamWorker(QObject):
         self._sig_stop_ntp_timer.emit()
 
         self._running = True
+        self._analysis_generation += 1
         self._receiving_external_chunks = False
+        self._overflows_seen = 0
         self._samples_since_last_analysis = 0
         self._has_emitted_telemetry = False
         self._eval_queued = False
@@ -394,7 +421,9 @@ class DSPStreamWorker(QObject):
                 self._hardware_capture.start()
                 self._sig_start_timer.emit(self.VISUAL_TIMER_INTERVAL_MS)
                 self._sig_start_telemetry_timer.emit(self.TELEMETRY_TIMER_INTERVAL_MS)
-                self._sig_start_ntp_timer.emit(self.NTP_DISCIPLINE_INTERVAL_MS)
+                # The NTP CPU skew only matters when the ADC is tracked against the host clock
+                if self.adc_dynamic_drift:
+                    self._sig_start_ntp_timer.emit(self.NTP_DISCIPLINE_INTERVAL_MS)
             except Exception as exc:
                 msg = (
                     f"Failed to open hardware audio device {self.device_id} "
@@ -415,6 +444,7 @@ class DSPStreamWorker(QObject):
         """Stop the active stream and halt synthetic timer or hardware capture."""
         was_running = self._running
         self._running = False
+        self._analysis_generation += 1
         self._eval_queued = False
         self._sig_stop_timer.emit()
         self._sig_stop_telemetry_timer.emit()
@@ -444,12 +474,13 @@ class DSPStreamWorker(QObject):
                 self.dsp_engine._sos = self.dsp_engine._design_bandpass_sos(
                     float(config.sample_rate),
                     self.dsp_engine.highpass_cutoff_hz,
-                    self.dsp_engine.lowpass_cutoff_hz,
+                    self.dsp_engine.highcut_hz,
                     self.dsp_engine.filter_order,
                 )
 
             self.dsp_engine.config = config
             self.dsp_engine.reset_filter_state()
+            self._analysis_generation += 1
             self._recompute_window_thresholds()
             self._samples_since_last_analysis = 0
             self._eval_queued = False
@@ -543,6 +574,16 @@ class DSPStreamWorker(QObject):
             return
 
         self._receiving_external_chunks = True
+
+        # An input overflow means PortAudio dropped samples: the buffer now holds two
+        # stretches of audio glued together with an unknown time gap, which turns into
+        # absurd rate/beat-error values. Discard pre-gap audio and warm up again.
+        cap = self._hardware_capture
+        overflows = int(cap.overflow_count) if cap is not None else 0
+        if overflows > self._overflows_seen:
+            self._overflows_seen = overflows
+            self._handle_stream_discontinuity()
+
         self.ring_buffer.write(samples)
         self.drift_estimator.update(n_samples, timestamp_ns=timestamp_ns)
         self._samples_since_last_analysis += n_samples
@@ -555,11 +596,27 @@ class DSPStreamWorker(QObject):
             self._eval_queued = True
             self._sig_schedule_eval.emit()
 
+    def _handle_stream_discontinuity(self) -> None:
+        """Drop buffered audio after a gap in the sample stream (e.g. input overflow)."""
+        self.discontinuity_count += 1
+        self.ring_buffer.clear()
+        self._samples_since_last_analysis = 0
+        self.dsp_engine.reset_filter_state()
+        self._analysis_generation += 1
+        if self.discontinuity_count == 1 or self.discontinuity_count % 20 == 0:
+            logger.warning(
+                "Audio stream discontinuity #%d (input overflow): analysis buffer reset",
+                self.discontinuity_count,
+            )
+
     @pyqtSlot()
     def _on_scheduled_eval(self) -> None:
-        """Execute scheduled visual and telemetry evaluation on the worker QThread."""
+        """Run a telemetry evaluation requested by the audio callback on the worker QThread.
+
+        Waveforms are produced by the 30 FPS visual timer; running them here as well (and
+        letting both the timer and this slot analyze the same audio) doubled the DSP load.
+        """
         self._eval_queued = False
-        self._on_visual_timer_tick()
         self._on_telemetry_timer_tick()
 
     @pyqtSlot()
@@ -628,24 +685,61 @@ class DSPStreamWorker(QObject):
                 float(self.drift_estimator.rate_bias_spd),
             )
 
-            if (
-                self.ring_buffer.available_samples >= self._min_analysis_samples
-                and self._samples_since_last_analysis > 0
-            ):
+            hop_ready = self._samples_since_last_analysis >= self._analysis_hop_samples or (
+                not self._has_emitted_telemetry and self._samples_since_last_analysis > 0
+            )
+            if self.ring_buffer.available_samples >= self._min_analysis_samples and hop_ready:
+                if self._analysis_busy():
+                    return
                 self._samples_since_last_analysis = 0
                 window = self.ring_buffer.read_latest(self._window_samples)
-                telemetry: BeatTelemetry = self.dsp_engine.process_window(
-                    window,
-                    bph=self.config.bph,
-                    lift_angle=self.config.lift_angle,
-                    effective_fs=effective_fs,
-                    streaming=False,
-                )
-                self._has_emitted_telemetry = True
-                self.telemetry_ready.emit(telemetry)
+                self._dispatch_analysis(window, effective_fs)
         except Exception as exc:
             logger.error("Error in telemetry timer tick: %s", exc, exc_info=True)
             self.error_occurred.emit(str(exc))
+
+    def _analysis_busy(self) -> bool:
+        """Return True while a background analysis is still running."""
+        fut = self._analysis_future
+        return fut is not None and not fut.done()
+
+    def _dispatch_analysis(self, window: NDArray[np.float64], effective_fs: float) -> None:
+        """Analyze ``window`` inline or on the background analysis thread."""
+        bph = int(self.config.bph)
+        lift = float(self.config.lift_angle)
+        generation = self._analysis_generation
+        if self._analysis_executor is None:
+            self._run_analysis(window, bph, lift, effective_fs, generation)
+            return
+        self._analysis_future = self._analysis_executor.submit(
+            self._run_analysis, window, bph, lift, effective_fs, generation
+        )
+
+    def _run_analysis(
+        self,
+        window: NDArray[np.float64],
+        bph: int,
+        lift_angle: float,
+        effective_fs: float,
+        generation: int,
+    ) -> None:
+        """Run ``DSPEngine.process_window`` and emit the telemetry if still current."""
+        try:
+            telemetry: BeatTelemetry = self.dsp_engine.process_window(
+                window,
+                bph=bph,
+                lift_angle=lift_angle,
+                effective_fs=effective_fs,
+                streaming=False,
+            )
+        except Exception as exc:
+            logger.error("Error in DSP analysis: %s", exc, exc_info=True)
+            self.error_occurred.emit(str(exc))
+            return
+        if generation != self._analysis_generation or not self._running:
+            return
+        self._has_emitted_telemetry = True
+        self.telemetry_ready.emit(telemetry)
 
     _on_synthetic_timer_tick = _on_visual_timer_tick
 
@@ -777,5 +871,9 @@ class DSPStreamWorker(QObject):
     def shutdown(self) -> None:
         """Stop streaming and cleanly shut down the DSPEngine worker pool."""
         self.stop_stream()
+        if self._analysis_executor is not None:
+            self._analysis_executor.shutdown(wait=True)
+            self._analysis_executor = None
+            self._analysis_future = None
         self.dsp_engine.shutdown(wait=True)
         logger.info("DSPStreamWorker shut down cleanly")

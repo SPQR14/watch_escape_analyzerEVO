@@ -123,6 +123,8 @@ class HardwareAudioCapture:
     the registered consumer callback.
     """
 
+    OVERFLOW_LOG_EVERY: int = 50
+
     def __init__(
         self,
         device_id: int | None,
@@ -131,6 +133,7 @@ class HardwareAudioCapture:
         callback: Callable[[NDArray[np.float64], int], None] | None = None,
         *,
         fs: float | None = None,
+        latency: str | float = "high",
     ) -> None:
         """Initialize the hardware audio capture stream configuration.
 
@@ -140,6 +143,10 @@ class HardwareAudioCapture:
             blocksize: Number of frames per PortAudio callback block (default 4096).
             callback: Consumer function invoked as ``callback(chunk_f64, timestamp_ns)``.
             fs: Optional alias for ``sample_rate``.
+            latency: PortAudio input latency (``"high"`` by default). A timegrapher does not
+                care about latency, while larger host buffers prevent input overflows
+                (dropped samples) when the Python side is briefly busy, which is frequent with
+                Windows MME/DirectSound drivers.
         """
         effective_fs = float(fs) if fs is not None else float(sample_rate)
         if effective_fs <= 0.0:
@@ -151,6 +158,7 @@ class HardwareAudioCapture:
         self.sample_rate: float = effective_fs
         self.blocksize: int = int(blocksize)
         self._callback: Callable[[NDArray[np.float64], int], None] | None = callback
+        self.latency: str | float = latency
         self._stream: object | None = None
         self._active: bool = False
         self.overflow_count: int = 0
@@ -181,12 +189,14 @@ class HardwareAudioCapture:
                 is_overflow = "overflow" in str(status).lower()
             if is_overflow:
                 self.overflow_count += 1
-                logger.warning(
-                    "PortAudio input overflow detected on device %s (total overflows=%d): %s",
-                    self.device_id,
-                    self.overflow_count,
-                    status,
-                )
+                # Logging does file/console I/O; keep the real-time audio thread lean.
+                if self.overflow_count == 1 or self.overflow_count % self.OVERFLOW_LOG_EVERY == 0:
+                    logger.warning(
+                        "PortAudio input overflow detected on device %s (total overflows=%d): %s",
+                        self.device_id,
+                        self.overflow_count,
+                        status,
+                    )
             elif bool(status) and not hasattr(status, "input_overflow"):
                 logger.debug("PortAudio callback status on device %s: %s", self.device_id, status)
 
@@ -216,7 +226,7 @@ class HardwareAudioCapture:
             samplerate=self.sample_rate,
             blocksize=self.blocksize,
             dtype="float32",
-            latency="low",
+            latency=self.latency,
             callback=self._portaudio_callback,
         )
         stream.start()

@@ -36,15 +36,24 @@ class SyntheticEscapeGenerator:
     def compute_p1_p3_delay(
         self, amplitude_deg: float, actual_beat_period: float | None = None
     ) -> float:
-        """Compute the exact time delay (seconds) between P1 (unlock) and P3 (drop).
+        """Compute the physical lift time (seconds) between P1 (unlock) and P3 (drop).
 
-        Uses the harmonic balance wheel motion equation:
-            theta(t) = amplitude_deg * sin(2 * pi * f0 * t)
-        Passing through the lift angle `lift_angle` centered around the equilibrium point
-        spans [-lift_angle / 2, +lift_angle / 2]:
-            sin(pi * f0 * dt) = lift_angle / (2 * amplitude_deg)
-            dt = (T_beat / pi) * arcsin(lift_angle / (2 * amplitude_deg))
-        where T_beat = 1 / (2 * f0) is the beat period.
+        The balance moves as ``theta(t) = A * sin(2 * pi * f_osc * t)``. The impulse pin
+        crosses the lift angle ``LA`` symmetrically around the dead point, i.e. from
+        ``-LA / 2`` to ``+LA / 2``, so::
+
+            t_lift = 2 * arcsin(LA / (2 * A)) / (2 * pi * f_osc)
+                   = arcsin(LA / (2 * A)) / (pi * f_osc)
+
+        With ``f_osc = 1 / (2 * T_beat)`` this is ``(2 * T_beat / pi) * arcsin(LA / (2 * A))``.
+        Example: 28800 BPH, A = 280 deg, LA = 52 deg -> t_lift ~= 7.40 ms.
+
+        Args:
+            amplitude_deg: Balance amplitude in degrees.
+            actual_beat_period: Real beat period in seconds (defaults to the nominal one).
+
+        Returns:
+            Lift time ``t_lift`` in seconds.
         """
         t_beat = (
             actual_beat_period
@@ -52,7 +61,16 @@ class SyntheticEscapeGenerator:
             else self.config.nominal_beat_period
         )
         ratio = np.clip(self.config.lift_angle / (2.0 * amplitude_deg), 1e-6, 0.999999)
-        return float((t_beat / np.pi) * np.arcsin(ratio))
+        return float((2.0 * t_beat / np.pi) * np.arcsin(ratio))
+
+    @staticmethod
+    def beat_error_half_offset(beat_error_ms: float) -> float:
+        """Return the alternating interval offset ``delta`` (seconds) for a beat error.
+
+        Timegrapher convention: beat intervals alternate ``P + delta`` / ``P - delta`` and the
+        reported beat error is ``|delta|`` (half the tick/tock interval difference).
+        """
+        return float(beat_error_ms) * 1e-3
 
     def generate(
         self,
@@ -82,7 +100,7 @@ class SyntheticEscapeGenerator:
         rate_factor = 1.0 + (true_rate_spd / self.SECONDS_PER_DAY)
         mean_beat_period = t0 / rate_factor
 
-        half_be_s = 0.5 * (true_beat_error_ms * 1e-3)
+        half_be_s = self.beat_error_half_offset(true_beat_error_ms)
 
         dt_p1_p3 = self.compute_p1_p3_delay(true_amplitude_deg, actual_beat_period=mean_beat_period)
         dt_p1_p2 = 0.28 * dt_p1_p3

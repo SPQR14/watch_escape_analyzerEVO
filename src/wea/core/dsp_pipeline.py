@@ -57,6 +57,15 @@ class EscapeDSPPipeline:
         high = min(self.HIGHCUT_HZ / nyquist, 0.999)
         return butter(self.FILTER_ORDER, [low, high], btype="bandpass", output="sos")
 
+    def max_lift_time_s(self, min_amplitude_deg: float = 140.0) -> float:
+        """Longest plausible P1 -> P3 lift time (s), reached at ``min_amplitude_deg``.
+
+        ``t_lift = arcsin(LA / (2 * A)) / (pi * f_osc)``, with a 10 % margin.
+        """
+        f_osc = self.config.nominal_oscillation_frequency
+        ratio = float(np.clip(self.config.lift_angle / (2.0 * min_amplitude_deg), 1e-6, 0.999))
+        return 1.10 * float(np.arcsin(ratio) / (np.pi * f_osc))
+
     def filter_signal(self, raw_signal: np.ndarray) -> np.ndarray:
         """Apply zero-phase forward-backward SOS Butterworth \
             bandpass filter."""
@@ -125,9 +134,11 @@ class EscapeDSPPipeline:
             else:
                 i += 1
 
-        # Expected maximum span of a single beat event (~12 ms around the coarse peak)
-        pre_samples = int(round(0.006 * fs))
-        post_samples = int(round(0.006 * fs))
+        # A beat spans a full lift time (P1 -> P3), up to ~20 ms at 18000 BPH and low
+        # amplitude, plus the decay of the sound. The coarse peak can sit on P1 or P3.
+        half_window_s = self.max_lift_time_s() + 0.0035
+        pre_samples = int(round(half_window_s * fs))
+        post_samples = int(round(half_window_s * fs))
 
         beats: list[BeatEvent] = []
         for c_idx in coarse_peaks:
@@ -249,22 +260,20 @@ class EscapeDSPPipeline:
             (nominal_period - measured_beat_period) / measured_beat_period
         )
 
-        # Beat Error in milliseconds: absolute difference between even and
-        #  odd beat intervals
-        beat_error_ms = abs(mean_even - mean_odd) * 1000.0
+        # Beat Error in milliseconds (timegrapher convention): intervals alternate
+        # P + d / P - d and the beat error is |d|, half the even/odd interval difference.
+        beat_error_ms = 0.5 * abs(mean_even - mean_odd) * 1000.0
 
-        # Balance wheel amplitude from P1 -> P3 transit time:
-        # sin(pi * dt / (2 * T_beat)) = lift_angle / (2 * amplitude_deg)
-        # Note: sin(pi * f0 * dt) where f0 = 1 / (2 * T_beat), so pi * f0 * dt = pi * dt / (2 * T_beat)
-        # Actually in SyntheticEscapeGenerator:
-        # dt = (T_beat / pi) * arcsin(lift_angle / (2 * amplitude_deg))
-        # => sin(pi * dt / T_beat) = lift_angle / (2 * amplitude_deg)
-        # => amplitude_deg = lift_angle / (2 * sin(pi * dt / T_beat))
+        # Balance wheel amplitude from the P1 -> P3 lift time t_lift:
+        # A = lift_angle / (2 * sin(pi * f_osc * t_lift)), f_osc = 1 / (2 * T_beat)
+        # => pi * f_osc * t_lift = pi * t_lift / (2 * T_beat)
         dt_p1_p3_arr = p3_times - p1_times
         median_dt = float(np.median(dt_p1_p3_arr))
 
         if median_dt > 1e-6:
-            sin_arg = np.clip((np.pi * median_dt) / measured_beat_period, 1e-6, np.pi - 1e-6)
+            sin_arg = np.clip(
+                (np.pi * median_dt) / (2.0 * measured_beat_period), 1e-6, np.pi - 1e-6
+            )
             sin_val = float(np.sin(sin_arg))
             if sin_val > 1e-6:
                 amplitude_deg = float(

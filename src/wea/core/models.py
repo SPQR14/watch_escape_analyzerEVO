@@ -107,6 +107,9 @@ class BeatTelemetry:
         micro_envelope: High-resolution sub-millisecond envelope for P1/P2/P3 inspection.
         filtered_signal: High-pass filtered acoustic waveform.
         effective_fs: Effective sampling frequency in Hz used during analysis.
+        bph: Beat rate (BPH) actually used for the analysis (0 if unknown).
+        detected_bph: BPH detected from the signal autocorrelation (0 if undetermined).
+        bph_mismatch: True when the configured BPH does not match the detected one.
     """
 
     rate_spd: float
@@ -124,3 +127,6 @@ class BeatTelemetry:
         default_factory=lambda: np.empty(0, dtype=np.float64)
     )
     effective_fs: float = 48000.0
+    bph: int = 0
+    detected_bph: int = 0
+    bph_mismatch: bool = False
